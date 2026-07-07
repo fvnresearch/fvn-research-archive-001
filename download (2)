@@ -1,0 +1,38 @@
+import json
+from pathlib import Path
+
+from fvn_dfm.normalization.sec_filing_event import (
+    extract_filing_events_from_files,
+    write_filing_refs_csv,
+)
+
+
+def test_extract_sec_filing_event_candidates_from_submissions_json(tmp_path: Path):
+    submissions_dir = tmp_path / "submissions"
+    submissions_dir.mkdir(parents=True)
+
+    payload = {
+        "cik": "320193",
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0000320193-23-000106", "0000320193-23-000001"],
+                "filingDate": ["2023-11-03", "2023-01-01"],
+                "reportDate": ["2023-09-30", "2022-12-31"],
+                "acceptanceDateTime": ["2023-11-03T18:10:43.000Z", "2023-01-01T00:00:00.000Z"],
+                "form": ["10-K", "8-K"],
+                "primaryDocument": ["aapl-20230930.htm", "aapl-8k.htm"],
+                "primaryDocDescription": ["10-K", "8-K"],
+            }
+        },
+    }
+    file_path = submissions_dir / "CIK0000320193.json"
+    file_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    df = extract_filing_events_from_files([file_path], included_forms=("10-K", "10-Q"))
+    assert len(df) == 1
+    assert df.iloc[0]["accession_number"] == "0000320193-23-000106"
+
+    refs = tmp_path / "complete_submission_filing_refs.csv"
+    write_filing_refs_csv(df, refs)
+    assert refs.exists()
+    assert "0000320193-23-000106" in refs.read_text(encoding="utf-8")
