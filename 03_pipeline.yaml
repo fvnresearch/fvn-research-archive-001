@@ -1,0 +1,53 @@
+universe:
+  primary_name: "US liquid SEC-reporting common operating companies"
+
+forms:
+  included_primary:
+    - "10-K"
+    - "10-Q"
+  included_appendix_only:
+    - "10-K/A"
+    - "10-Q/A"
+  excluded:
+    - "8-K"
+    - "20-F"
+    - "40-F"
+    - "6-K"
+    - "S-1"
+    - "424B"
+    - "DEF 14A"
+    - "NT 10-K"
+    - "NT 10-Q"
+
+security_filters:
+  include_common_stock_only: true
+  exclude_adrs: true
+  exclude_etfs: true
+  exclude_closed_end_funds: true
+  exclude_mutual_funds: true
+  exclude_preferred: true
+  exclude_warrants: true
+  exclude_units: true
+  exclude_otc: true
+  exclude_spac_units: true
+
+sector_policy:
+  exclude_financials_primary: true
+  financials_appendix_allowed: true
+  biotech_exclusion_robustness_required: true
+
+liquidity_filters:
+  min_price_usd: 5.0
+  min_median_60d_dollar_volume_usd: 5000000
+  min_prior_trading_days: 252
+
+mapping_policy:
+  eligible_mapping_confidence_levels: [1, 2]
+  level_3_requires_manual_exception: true
+  level_4_excluded: true
+  max_level_4_rate_for_modeling: 0.10
+
+coverage_gates:
+  min_execution_price_coverage: 0.90
+  min_valid_63d_label_coverage: 0.90
+  delisting_missingness_verdict_cap: true

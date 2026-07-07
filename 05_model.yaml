@@ -1,0 +1,153 @@
+feature_version: "DFM_FEATURES_V1"
+
+preprocessing:
+  winsorization:
+    method: "cross_sectional_by_signal_month"
+    lower_percentile: 0.01
+    upper_percentile: 0.99
+  standardization:
+    primary: "robust_zscore_by_signal_month"
+    center: "median"
+    scale: "mad"
+    fallback: "mean_std_zscore"
+  missingness:
+    native_missing_for_gbdt: true
+    median_impute_for_linear_models: true
+    create_missingness_indicators: true
+
+fundamental_reality_layer:
+  groups:
+    growth:
+      - revenue_growth_yoy
+      - gross_profit_growth_yoy
+      - operating_income_growth_yoy
+      - net_income_growth_yoy
+      - asset_growth_yoy
+    profitability:
+      - gross_margin
+      - operating_margin
+      - net_margin
+      - gross_margin_change_yoy
+      - operating_margin_change_yoy
+      - net_margin_change_yoy
+    cash_conversion:
+      - cfo_to_net_income
+      - cfo_minus_net_income_scaled_assets
+      - cash_conversion_deterioration
+    accruals:
+      - accruals_assets
+      - accrual_deterioration
+    working_capital:
+      - receivables_stress
+      - inventory_stress
+      - payables_stress
+      - working_capital_assets
+      - working_capital_deterioration
+    leverage:
+      - debt_assets
+      - debt_change_yoy
+      - interest_coverage
+      - leverage_stress
+    dilution:
+      - share_growth_yoy
+      - dilution_stress
+    investment:
+      - capex_sales
+      - capex_sales_change_yoy
+      - investment_expansion
+    distress:
+      - fundamental_stress
+      - fundamental_improvement
+
+disclosure_narrative_layer:
+  dictionary_source: "loughran_mcdonald"
+  sections:
+    - full_document
+    - mda_section
+    - risk_factors_section
+    - liquidity_section
+  groups:
+    tone:
+      - negative_share
+      - positive_share
+      - net_tone
+      - tone_optimism
+      - tone_negativity
+    uncertainty:
+      - uncertainty_share
+      - uncertainty_score
+    legal_constraints:
+      - litigious_share
+      - constraining_share
+      - legal_constraint_score
+    modal_language:
+      - strong_modal_share
+      - weak_modal_share
+      - weak_commitment_score
+    complexity:
+      - complexity_share
+      - avg_word_length
+      - avg_sentence_length
+      - long_word_share
+      - complexity_score
+    length_expansion:
+      - document_word_count
+      - mda_word_count
+      - risk_word_count
+      - risk_expansion
+      - mda_expansion
+    boilerplate:
+      - boilerplate_similarity
+      - boilerplate_persistence
+    narrative_drift:
+      - narrative_drift
+      - mda_drift
+      - risk_drift
+      - liquidity_drift
+
+mismatch_layer:
+  downside:
+    - stress_x_optimism
+    - stress_x_low_negativity
+    - stress_x_complexity
+    - stress_x_boilerplate
+    - cash_stress_x_positive_tone
+    - accrual_stress_x_optimism
+    - receivables_stress_x_low_warning
+    - inventory_stress_x_low_negativity
+    - margin_deterioration_x_optimism
+    - debt_stress_x_weak_commitment
+    - dilution_x_optimism
+  upside:
+    - improvement_x_negativity
+    - improvement_x_conservative_tone
+    - cash_improvement_x_caution
+    - margin_improvement_x_low_positivity
+    - wc_improvement_x_conservative_language
+  composites:
+    - downside_mismatch
+    - upside_mismatch
+    - net_mismatch
+    - dfm_simple
+
+control_layer:
+  required:
+    - log_market_cap_proxy
+    - log_price
+    - log_median_60d_dollar_volume
+    - realized_vol_63d
+    - momentum_12_1
+    - short_term_reversal_1m
+    - trailing_market_beta
+    - sector
+    - industry
+    - filing_type
+    - signal_month
+    - days_since_fiscal_period_end
+    - days_since_prior_comparable_filing
+
+coverage_thresholds:
+  min_mandatory_fundamental_valid: 0.70
+  full_document_text_required: true
+  min_narrative_valid: 0.50
+  min_mismatch_valid: 0.40

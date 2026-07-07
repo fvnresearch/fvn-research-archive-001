@@ -1,0 +1,72 @@
+model:
+  primary_family: "gradient_boosted_decision_trees"
+  primary_implementations_allowed:
+    - lightgbm
+    - xgboost
+  primary_training_mode: "regression"
+  primary_prediction_format: "cross_sectional_rank"
+  primary_target: "forward_63d_sector_adjusted_return"
+  forbidden_primary_models:
+    - llm
+    - transformer
+    - deep_neural_network
+    - automl
+    - genetic_programming
+    - reinforcement_learning
+
+variants:
+  - id: "DFM_SIMPLE"
+    inputs: ["net_mismatch"]
+    purpose: "transparent_composite_baseline"
+  - id: "ELASTIC_NET_FULL"
+    inputs: ["fundamental", "text", "mismatch", "controls"]
+    purpose: "linear_benchmark"
+  - id: "GBDT_FULL"
+    inputs: ["fundamental", "text", "mismatch", "controls"]
+    purpose: "primary_model"
+  - id: "GBDT_NO_MISMATCH"
+    inputs: ["fundamental", "text", "controls"]
+    purpose: "core_ablation"
+  - id: "GBDT_FUNDAMENTAL_ONLY"
+    inputs: ["fundamental", "controls"]
+    purpose: "accounting_baseline"
+  - id: "GBDT_TEXT_ONLY"
+    inputs: ["text", "controls"]
+    purpose: "narrative_baseline"
+  - id: "GBDT_TONE_ONLY"
+    inputs: ["tone", "controls"]
+    purpose: "sentiment_baseline"
+  - id: "GBDT_MISMATCH_ONLY"
+    inputs: ["mismatch", "minimal_controls"]
+    purpose: "mechanism_validation"
+  - id: "GBDT_CONTROLS_ONLY"
+    inputs: ["controls"]
+    purpose: "exposure_replication_test"
+
+hyperparameter_budget:
+  max_configs_per_walkforward_month_per_family: 40
+  search_method: "seeded_randomized_grid"
+  selection_metric_primary: "validation_mean_monthly_rank_ic"
+  selection_metric_secondary:
+    - validation_decile_spread
+    - validation_monotonicity
+    - validation_exposure_cleanliness
+    - mismatch_group_importance
+
+gbdt_search_space:
+  n_estimators: [100, 250, 500, 750, 1000]
+  learning_rate: [0.01, 0.03, 0.05, 0.10]
+  max_depth: [2, 3, 4, 5, 6]
+  num_leaves: [8, 16, 32, 64]
+  min_child_samples: [50, 100, 250, 500]
+  subsample: [0.6, 0.8, 1.0]
+  colsample_bytree: [0.5, 0.7, 1.0]
+  reg_alpha: [0, 0.1, 1, 10]
+  reg_lambda: [0, 1, 10, 50]
+  early_stopping_rounds: [25, 50, 100]
+
+model_registry:
+  required: true
+  output_path: "outputs/models/model_registry.csv"
+  store_model_artifacts: true
+  checksum_artifacts: true

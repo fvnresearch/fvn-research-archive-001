@@ -1,0 +1,65 @@
+pipeline:
+  raw_archive_immutable: true
+  no_overwrite_policy: true
+  create_new_version_on_correction: true
+
+layers:
+  layer_0_raw_archive:
+    required: true
+    manifest: "data/manifests/raw_file_manifest.csv"
+
+  layer_1_normalized_source_tables:
+    output_dir: "data/processed/source_tables"
+    tables:
+      - sec_filer_master
+      - sec_filing_event
+      - sec_accession_document
+      - sec_filing_header
+      - sec_xbrl_fact_raw
+      - filing_text_raw
+      - filing_section_text
+      - security_master
+      - ticker_cik_link_asof
+      - price_daily_adjusted
+      - factor_daily
+
+  layer_2_point_in_time_tables:
+    output_dir: "data/processed/point_in_time"
+    tables:
+      - filing_availability
+      - fundamental_fact_availability
+      - text_availability
+      - price_availability
+      - security_tradability_status
+      - universe_membership_asof
+
+  layer_3_feature_store:
+    output_dir: "data/processed/features"
+    tables:
+      - fundamental_features_asof
+      - text_features_asof
+      - mismatch_features_asof
+      - control_features_asof
+
+  layer_4_signal_and_return_store:
+    output_dir: "data/processed/panels"
+    label_dir: "data/processed/labels"
+    tables:
+      - model_research_panel
+      - future_return_label
+      - execution_price_panel
+
+timestamp_policy:
+  source_of_truth: "EDGAR_ACCEPTANCE_DATETIME"
+  no_trade_on_filing_day_primary: true
+  if_accepted_before_market_close: "execute_close_T_plus_1"
+  if_accepted_at_or_after_market_close: "execute_close_T_plus_2"
+  ambiguous_timestamp_policy: "use_more_conservative_execution_date"
+
+data_quality_gates:
+  min_downloaded_target_filings: 0.95
+  min_included_timestamp_validity: 0.99
+  min_full_text_validity: 0.90
+  min_core_xbrl_coverage: 0.80
+  min_mapping_level_1_2_rate: 0.90
+  min_price_label_coverage: 0.90

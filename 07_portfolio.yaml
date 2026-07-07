@@ -1,0 +1,51 @@
+oos_engine:
+  version: "DFM_OOS_ENGINE_V1"
+  engine_type: "monthly_sequential_expanding_window_walk_forward"
+  primary_oos_start: "2016-01-01"
+  prediction_frequency: "monthly"
+  target_horizon_trading_days: 63
+  label_availability_embargo_required: true
+
+split_logic:
+  model_fit_date: "first_trading_day_of_prediction_month_before_market_open"
+  label_cutoff_date: "previous_trading_day_before_model_fit_date"
+  training_validation_eligible_rule: "horizon_end_date <= label_cutoff_date"
+  validation_window_length_months: 12
+  training_window_type: "expanding"
+  train_on_validation_after_selection_primary: false
+
+sample_gates:
+  min_training_rows: 20000
+  min_validation_rows: 2000
+  min_training_years: 5
+  min_validation_months: 9
+  min_training_securities: 500
+  min_validation_securities: 300
+  min_distinct_sectors_training: 8
+
+oos_year_reporting:
+  min_valid_prediction_months_per_year: 9
+  min_expected_signal_coverage_per_year: 0.70
+
+immutability:
+  monthly_prediction_files_immutable: true
+  overwrite_predictions_allowed: false
+  invalid_runs_archived: true
+  create_new_engine_version_on_structural_change: true
+
+leakage_checks:
+  train_labels_realized_before_fit: true
+  validation_labels_realized_before_fit: true
+  no_oos_rows_in_train_validation: true
+  oos_features_available_before_execution: true
+  no_oos_labels_loaded_before_prediction_saved: true
+  no_future_standardization: true
+  no_current_ticker_backfill: true
+  no_future_price_controls: true
+
+outputs:
+  prediction_dir: "outputs/predictions/oos_predictions_monthly"
+  stitched_panel: "outputs/predictions/stitched_oos_prediction_panel.parquet"
+  coverage_by_month: "outputs/diagnostics/oos_coverage_by_month.csv"
+  coverage_by_year: "outputs/diagnostics/oos_coverage_by_year.csv"
+  leakage_log: "logs/oos/leakage_check_log.csv"

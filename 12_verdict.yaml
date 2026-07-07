@@ -1,0 +1,76 @@
+tearsheet:
+  version: "DFM_TEARSHEET_V1"
+  title: "FVN Research Archive 001 — Disclosure-Fundamental Mismatch"
+  subtitle: "Walk-Forward Out-of-Sample Evidence After Costs, Baselines, Ablations, and Failure Tests"
+  output_pdf: "reports/tearsheets/DFM_institutional_tearsheet.pdf"
+  output_html: "reports/tearsheets/DFM_institutional_tearsheet.html"
+  max_main_pages: 40
+
+required_status_labels:
+  - dataset_status
+  - oos_engine_status
+  - portfolio_status
+  - baseline_status
+  - mechanism_status
+  - failure_test_status
+  - preliminary_verdict
+
+required_pages:
+  - executive_verdict_dashboard
+  - research_claim_and_acceptance_standard
+  - research_design_snapshot
+  - dataset_integrity_dashboard
+  - oos_coverage_dashboard
+  - primary_oos_equity_curve_after_costs
+  - before_cost_vs_after_cost
+  - annual_oos_performance
+  - monthly_return_heatmap
+  - drawdown_recovery_profile
+  - prediction_quality_diagnostics
+  - decile_monotonicity
+  - long_short_leg_decomposition
+  - factor_regression_summary
+  - exposure_dashboard
+  - turnover_cost_drag
+  - liquidity_capacity_proxy
+  - baseline_comparison_summary
+  - incremental_value_over_baselines
+  - baseline_spanning_regression
+  - ablation_summary
+  - feature_family_removal_waterfall
+  - mechanism_grid_dashboard
+  - long_short_mechanism_profile
+  - failure_test_dashboard
+  - randomization_placebo_results
+  - execution_delay_timing
+  - size_liquidity_sector_stress
+  - outlier_concentration_stress
+  - data_quality_survivorship_stress
+  - final_decision_matrix
+
+chart_rules:
+  no_in_sample_main_charts: true
+  main_performance_after_costs_only: true
+  cost_assumption_must_be_visible: true
+  oos_label_must_be_visible: true
+  no_cropped_drawdowns: true
+  source_table_required: true
+
+red_flag_box_required_if:
+  - after_cost_return_negative
+  - cost_10bps_kills_signal
+  - no_mismatch_matches_full
+  - randomized_labels_match_full
+  - shuffled_mismatch_matches_full
+  - performance_one_year_dominated
+  - illiquid_names_drive_alpha
+  - missing_labels_bottom_decile_concentrated
+  - delisting_data_incomplete
+  - high_quality_text_test_fails
+  - high_quality_xbrl_test_fails
+
+reproducibility:
+  generated_from_frozen_files_only: true
+  chart_manifest_required: true
+  table_manifest_required: true
+  checksum_required: true

@@ -1,0 +1,69 @@
+baselines:
+  version: "DFM_BASELINES_V1"
+  same_oos_engine_required: true
+  same_portfolio_engine_required: true
+  same_universe_required: true
+  same_costs_required: true
+
+critical_ml_baselines:
+  controls_only:
+    inputs: ["controls"]
+  fundamental_only:
+    inputs: ["fundamental", "controls"]
+  text_only:
+    inputs: ["text", "controls"]
+  tone_only:
+    inputs: ["tone", "controls"]
+  no_mismatch_full:
+    inputs: ["fundamental", "text", "controls"]
+  mismatch_only:
+    inputs: ["mismatch", "minimal_controls"]
+  elastic_net_full:
+    inputs: ["fundamental", "text", "mismatch", "controls"]
+
+known_anomaly_baselines:
+  momentum:
+    signal: "momentum_12_1"
+  short_term_reversal:
+    signal: "prior_1m_return"
+  value:
+    signal_candidates:
+      - book_to_market_proxy
+      - earnings_yield
+      - sales_to_price
+      - cash_flow_to_price
+  quality:
+    signal_candidates:
+      - gross_profitability
+      - operating_profitability
+      - return_on_assets
+      - cfo_profitability
+  accruals:
+    signal: "accruals_assets"
+  asset_growth:
+    signal: "asset_growth_yoy"
+  low_volatility:
+    signal: "realized_vol_63d"
+  size:
+    signal: "log_market_cap_proxy"
+  liquidity:
+    signal: "log_median_60d_dollar_volume"
+
+anomaly_composite:
+  method: "equal_weight_primary"
+  validation_frozen_weighting_appendix_allowed: true
+
+dominance_required_for_verdict_a:
+  - no_mismatch_full
+  - fundamental_only
+  - text_only
+  - tone_only
+  - controls_only
+  - anomaly_composite
+
+outputs:
+  prediction_metrics: "outputs/baselines/baseline_prediction_metrics.csv"
+  portfolio_metrics: "outputs/baselines/baseline_portfolio_metrics.csv"
+  factor_alpha_table: "outputs/baselines/baseline_factor_alpha_table.csv"
+  incremental_difference_table: "outputs/baselines/baseline_incremental_difference_table.csv"
+  spanning_regression: "outputs/baselines/baseline_spanning_regression.csv"

@@ -1,0 +1,49 @@
+project:
+  project_id: "FVN_RA001_DFM"
+  project_name: "FVN Research Archive 001"
+  signal_name: "Disclosure-Fundamental Mismatch"
+  short_name: "DFM"
+  research_class: "Public Markets / Public Data / ML Signal Research"
+  owner: "Lead Quantitative Researcher, FVN Research"
+  status: "sprint_01_research_infrastructure"
+  verdict_status: "pending"
+
+time:
+  timezone: "America/New_York"
+  primary_start_date: "2009-01-01"
+  primary_oos_start_date: "2016-01-01"
+  latest_complete_oos_year_policy: "require_complete_forward_labels"
+  current_year_policy: "live_forward_extension_only"
+
+principles:
+  in_sample_is_alpha_evidence: false
+  oos_tuning_allowed: false
+  public_output_before_verdict_allowed: false
+  overwrite_raw_data_allowed: false
+  overwrite_oos_predictions_allowed: false
+  feature_lineage_required: true
+  label_separation_required: true
+
+versioning:
+  dataset_version: "pending"
+  feature_version: "DFM_FEATURES_V1"
+  label_version: "DFM_LABELS_V1"
+  model_version: "DFM_MODEL_V1"
+  oos_engine_version: "DFM_OOS_ENGINE_V1"
+  portfolio_version: "DFM_PORTFOLIO_V1"
+  baseline_version: "DFM_BASELINES_V1"
+  ablation_version: "DFM_ABLATIONS_V1"
+  failure_test_version: "DFM_FAILURE_TESTS_V1"
+
+randomness:
+  random_seed_base: 1001
+  randomized_test_seeds: 100
+
+paths:
+  raw_data_dir: "data/raw"
+  interim_data_dir: "data/interim"
+  processed_data_dir: "data/processed"
+  manifest_dir: "data/manifests"
+  output_dir: "outputs"
+  report_dir: "reports"
+  log_dir: "logs"

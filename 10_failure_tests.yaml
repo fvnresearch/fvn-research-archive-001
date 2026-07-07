@@ -1,0 +1,66 @@
+ablations:
+  version: "DFM_ABLATIONS_V1"
+  same_oos_engine_required: true
+  same_portfolio_engine_required: true
+
+core_ablations:
+  - full_dfm
+  - no_mismatch_full
+  - mismatch_only
+  - fundamental_only
+  - text_only
+  - tone_only
+  - controls_only
+  - dfm_simple
+
+feature_family_removal:
+  - remove_fundamental_stress
+  - remove_working_capital
+  - remove_cash_conversion
+  - remove_accruals
+  - remove_margins
+  - remove_leverage
+  - remove_dilution
+  - remove_complexity
+  - remove_boilerplate
+  - remove_uncertainty_modal
+  - remove_risk_expansion
+
+directional_mismatch:
+  - downside_mismatch_only
+  - upside_mismatch_only
+  - full_minus_downside_mismatch
+  - full_minus_upside_mismatch
+
+mechanism_grids:
+  - fundamental_stress_x_narrative_optimism
+  - cash_deterioration_x_positive_tone
+  - accrual_deterioration_x_optimism
+  - receivables_stress_x_risk_expansion
+  - inventory_stress_x_negative_tone
+  - margin_deterioration_x_optimism
+  - debt_stress_x_weak_commitment
+  - fundamental_improvement_x_conservative_language
+
+quality_robustness:
+  - high_text_quality_only
+  - high_xbrl_quality_only
+  - no_exhibit_contamination
+  - no_custom_tag_heavy_filings
+  - no_ytd_conversion_rows
+  - full_document_only_text
+  - section_only_text
+
+acceptance_gates:
+  full_beats_no_mismatch: true
+  mismatch_only_positive: true
+  removing_mismatch_weakens_model: true
+  mechanism_grids_supportive: true
+  long_short_profiles_coherent: true
+
+outputs:
+  core_metrics: "outputs/ablations/core_ablation_metrics.csv"
+  feature_family_metrics: "outputs/ablations/feature_family_removal_metrics.csv"
+  mechanism_grid_results: "outputs/ablations/mechanism_grid_results.csv"
+  long_short_profile: "outputs/ablations/long_short_mechanism_profile.csv"
+  mechanism_verdict_matrix: "outputs/ablations/mechanism_verdict_matrix.csv"

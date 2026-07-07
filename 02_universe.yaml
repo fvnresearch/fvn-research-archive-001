@@ -1,0 +1,67 @@
+sec:
+  request_policy:
+    max_requests_per_second: 5
+    user_agent: "FVN Research contact_email_to_be_set"
+    retry_count: 5
+    retry_backoff_seconds: [1, 2, 5, 10, 30]
+    record_http_status: true
+
+  endpoints:
+    submissions_base: "https://data.sec.gov/submissions/"
+    companyfacts_base: "https://data.sec.gov/api/xbrl/companyfacts/"
+    companyconcept_base: "https://data.sec.gov/api/xbrl/companyconcept/"
+    sec_archives_base: "https://www.sec.gov/Archives/edgar/data/"
+    financial_statement_data_sets_page: "https://www.sec.gov/data-research/sec-markets-data/financial-statement-data-sets"
+
+  raw_storage:
+    submissions: "data/raw/sec/submissions"
+    complete_submissions: "data/raw/sec/complete_submissions"
+    primary_documents: "data/raw/sec/primary_documents"
+    xbrl_companyfacts: "data/raw/sec/xbrl_companyfacts"
+    financial_statement_data_sets: "data/raw/sec/financial_statement_data_sets"
+
+external_public_sources:
+  loughran_mcdonald:
+    source_page: "https://sraf.nd.edu/loughranmcdonald-master-dictionary/"
+    storage_dir: "data/raw/dictionaries/loughran_mcdonald"
+    freeze_version_at_download: true
+    checksum_required: true
+
+  kenneth_french:
+    source_page: "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html"
+    storage_dir: "data/raw/factors/kenneth_french"
+    files_required:
+      - "Fama/French 3 Factors"
+      - "Fama/French 5 Factors"
+      - "Momentum Factor"
+      - "Daily Factors where required"
+    checksum_required: true
+
+price_data:
+  source_name: "to_be_selected_after_audit"
+  storage_dir: "data/raw/prices"
+  required_fields:
+    - date
+    - ticker
+    - open
+    - high
+    - low
+    - close
+    - adjusted_close
+    - volume
+    - split_factor
+    - dividend_amount
+    - delisting_flag
+    - delisting_return
+  survivorship_audit_required: true
+  delisting_coverage_required_for_verdict_a: true
+
+mapping_data:
+  storage_dir: "data/raw/mappings"
+  current_ticker_mapping_may_not_be_used_backward: true
+  historical_mapping_required: true
+
+manifests:
+  raw_file_manifest: "data/manifests/raw_file_manifest.csv"
+  source_vintage_required: true
+  sha256_required: true

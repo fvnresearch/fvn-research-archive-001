@@ -1,0 +1,56 @@
+portfolio:
+  version: "DFM_PORTFOLIO_V1"
+  primary_type: "monthly_rebalanced_dollar_neutral_long_short_decile"
+  input_panel: "outputs/predictions/stitched_oos_prediction_panel.parquet"
+
+rebalance:
+  frequency: "monthly"
+  rebalance_day: "last_trading_day_of_month"
+  execution_price: "adjusted_close"
+  stale_signal_policy: "signal_eligible_for_month_of_first_allowed_execution_only"
+
+construction:
+  long_bucket: "top_decile"
+  short_bucket: "bottom_decile"
+  long_exposure: 0.50
+  short_exposure: -0.50
+  gross_exposure: 1.00
+  net_exposure: 0.00
+  weighting: "equal_weight_within_side"
+  max_abs_single_name_weight: 0.02
+  min_long_names: 30
+  min_short_names: 30
+  min_eligible_securities_before_deciles: 300
+  duplicate_signal_policy: "use_most_recent_valid_signal_per_security_per_rebalance"
+
+transaction_costs:
+  primary_one_way_bps: 10
+  sensitivity_one_way_bps: [0, 5, 10, 25, 50]
+  apply_to_traded_notional: true
+  cost_formula: "cost_bps * sum_abs_weight_change"
+
+robustness_portfolios:
+  sector_neutral_required: true
+  beta_neutral_required: true
+  long_only_diagnostic_required: true
+  short_only_diagnostic_required: true
+
+capacity:
+  hypothetical_aum_usd: [1000000, 10000000, 50000000, 100000000]
+  adv_usage_required: true
+
+factor_regression:
+  required_models:
+    - CAPM
+    - FF3
+    - FF5
+    - FF5_MOM
+  newey_west_required: true
+
+outputs:
+  positions: "outputs/portfolios/portfolio_positions_by_month.parquet"
+  trades: "outputs/portfolios/portfolio_trades_by_month.parquet"
+  returns_after_cost: "outputs/portfolios/portfolio_returns_after_cost.csv"
+  returns_before_cost: "outputs/portfolios/portfolio_returns_before_cost.csv"
+  factor_regressions: "outputs/portfolios/factor_regression_results.csv"
+  turnover: "outputs/portfolios/turnover_by_month.csv"
