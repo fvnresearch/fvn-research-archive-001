@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Private / raw / generated heavy data
+data/raw/
+data/interim/
+data/external/
+data/processed/features/
+data/processed/model/
+data/processed/portfolio/
+data/processed/source_tables/
+data/processed/targets/
+data/processed/text/
+logs/
+outputs/logs/
+outputs/smoke/
+
+# Local
+.env
+*.local
+.DS_Store
