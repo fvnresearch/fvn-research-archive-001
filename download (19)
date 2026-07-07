@@ -1,0 +1,468 @@
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from fvn_dfm.data_ingestion.sec_financial_statement_datasets import safe_write_table
+from fvn_dfm.utils.logging import get_logger
+from fvn_dfm.utils.paths import root
+
+
+MISMATCH_FEATURE_VERSION = "DFM_MISMATCH_FEATURES_V0"
+
+CORE_OUTPUT_COLUMNS = [
+    "cik",
+    "cik10",
+    "accession_number",
+    "primary_document",
+    "accession_lineage_key",
+    "feature_asof_date",
+    "accepted_at_edgar",
+    "timestamp_quality_flag",
+    "fundamental_composite_quality_flag",
+    "full_parse_quality_flag",
+    "mda_section_quality_flag",
+    "risk_section_quality_flag",
+    "liquidity_section_quality_flag",
+    "fund_stress_score",
+    "fund_improve_score",
+    "fund_net_stress_score",
+    "fund_net_improvement_score",
+    "fundamental_reality_score",
+    "downside_mismatch_score",
+    "upside_mismatch_score",
+    "net_mismatch_score",
+    "dfm_score_simple",
+    "downside_component_valid_count",
+    "upside_component_valid_count",
+    "downside_component_coverage_ratio",
+    "upside_component_coverage_ratio",
+    "mismatch_quality_flag",
+    "mismatch_quality_notes",
+    "mismatch_feature_version",
+]
+
+
+DOWNSIDE_COMPONENTS: dict[str, tuple[str, str]] = {
+    # Stress + disclosure optimism / insufficient warning.
+    "stress_x_full_positive_tone": ("fund_stress_score", "full_lm_positive_share"),
+    "stress_x_full_net_positive_tone": ("fund_stress_score", "full_lm_pos_neg_balance_pos"),
+    "stress_x_mda_positive_tone": ("fund_stress_score", "mda_lm_positive_share"),
+    "stress_x_mda_net_positive_tone": ("fund_stress_score", "mda_lm_pos_neg_balance_pos"),
+    "stress_x_low_full_negative_tone": ("fund_stress_score", "full_low_negative_proxy"),
+    "stress_x_low_risk_negative_tone": ("fund_stress_score", "risk_low_negative_proxy"),
+
+    # Stress + uncertainty/complexity/legal/constraint language.
+    "stress_x_full_uncertainty": ("fund_stress_score", "full_lm_uncertainty_share"),
+    "stress_x_mda_uncertainty": ("fund_stress_score", "mda_lm_uncertainty_share"),
+    "stress_x_risk_litigious": ("fund_stress_score", "risk_lm_litigious_share"),
+    "stress_x_full_constraining": ("fund_stress_score", "full_lm_constraining_share"),
+    "stress_x_risk_constraining": ("fund_stress_score", "risk_lm_constraining_share"),
+
+    # Specific accounting deterioration mechanisms + disclosure language.
+    "margin_deterioration_x_positive_tone": ("stress_margin_deterioration_pos", "full_lm_positive_share"),
+    "cfo_deterioration_x_positive_tone": ("stress_cfo_quality_deterioration_pos", "mda_lm_positive_share"),
+    "cash_conversion_deterioration_x_positive_tone": ("stress_cash_conversion_deterioration_pos", "mda_lm_positive_share"),
+    "leverage_increase_x_weak_warning": ("stress_leverage_increase_pos", "risk_low_negative_proxy"),
+    "liability_intensity_increase_x_constraining": ("stress_liability_intensity_increase_pos", "risk_lm_constraining_share"),
+    "receivables_intensity_increase_x_low_warning": ("stress_receivables_intensity_increase_pos", "risk_low_negative_proxy"),
+    "inventory_intensity_increase_x_low_warning": ("stress_inventory_intensity_increase_pos", "risk_low_negative_proxy"),
+    "share_dilution_x_positive_tone": ("stress_share_dilution_pos", "full_lm_positive_share"),
+}
+
+UPSIDE_COMPONENTS: dict[str, tuple[str, str]] = {
+    # Improvement + disclosure caution / under-promotion.
+    "improvement_x_full_negative_tone": ("fund_improve_score", "full_lm_negative_share"),
+    "improvement_x_full_net_negative_tone": ("fund_improve_score", "full_lm_pos_neg_balance_neg"),
+    "improvement_x_mda_negative_tone": ("fund_improve_score", "mda_lm_negative_share"),
+    "improvement_x_risk_negative_tone": ("fund_improve_score", "risk_lm_negative_share"),
+    "improvement_x_uncertainty": ("fund_improve_score", "full_lm_uncertainty_share"),
+    "improvement_x_constraining": ("fund_improve_score", "full_lm_constraining_share"),
+    "improvement_x_modal_caution": ("fund_improve_score", "full_lm_modal_total_share"),
+
+    # Specific accounting improvement mechanisms + conservative language.
+    "margin_improvement_x_negative_tone": ("improve_margin_improvement_pos", "full_lm_negative_share"),
+    "cfo_improvement_x_negative_tone": ("improve_cfo_quality_improvement_pos", "mda_lm_negative_share"),
+    "cash_conversion_improvement_x_negative_tone": ("improve_cash_conversion_improvement_pos", "mda_lm_negative_share"),
+    "leverage_decline_x_risk_caution": ("improve_leverage_decline_pos", "risk_lm_negative_share"),
+    "cash_buffer_improvement_x_caution": ("improve_cash_buffer_improvement_pos", "liquidity_lm_negative_share"),
+    "working_capital_improvement_x_caution": ("improve_working_capital_proxy_improvement_pos", "liquidity_lm_negative_share"),
+    "share_count_decline_x_low_positive_tone": ("improve_share_count_decline_pos", "full_low_positive_proxy"),
+}
+
+
+@dataclass(frozen=True)
+class MismatchFeaturesConfig:
+    fundamental_composite_features_path: Path
+    text_features_path: Path
+    output_table_path: Path
+    output_csv_path: Path
+    diagnostics_path: Path
+    feature_version: str = MISMATCH_FEATURE_VERSION
+    min_downside_components: int = 8
+    min_upside_components: int = 6
+
+
+def read_table(path: str | Path) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Input table not found: {p}")
+    if p.suffix == ".parquet":
+        return pd.read_parquet(p)
+    return pd.read_csv(p, dtype=str).fillna("")
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    clean = str(value).strip()
+    if clean == "":
+        return None
+    try:
+        number = float(clean)
+    except Exception:
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def _round_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value, 12)
+
+
+def _positive_part(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return max(value, 0.0)
+
+
+def _mean_nonmissing(values: list[float | None]) -> float | None:
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+    return sum(valid) / len(valid)
+
+
+def _safe_text_feature(row: pd.Series, column: str) -> float | None:
+    return _to_float(row.get(column, None))
+
+
+def _prepare_text_features(text: pd.DataFrame) -> pd.DataFrame:
+    out = text.copy()
+
+    # Accession-level key. Text lineage includes primary document, while the
+    # fundamental layer is accession-level.
+    out["_join_key"] = out["cik10"].astype(str) + ":" + out["accession_number"].astype(str)
+
+    for prefix in ["full", "mda", "risk", "liquidity"]:
+        neg_col = f"{prefix}_lm_negative_share"
+        pos_col = f"{prefix}_lm_positive_share"
+        balance_col = f"{prefix}_lm_pos_neg_balance"
+
+        if neg_col in out.columns:
+            neg = pd.to_numeric(out[neg_col], errors="coerce").fillna(0.0)
+            out[f"{prefix}_low_negative_proxy"] = 1.0 / (1.0 + neg)
+        else:
+            out[f"{prefix}_low_negative_proxy"] = 1.0
+
+        if pos_col in out.columns:
+            pos = pd.to_numeric(out[pos_col], errors="coerce").fillna(0.0)
+            out[f"{prefix}_low_positive_proxy"] = 1.0 / (1.0 + pos)
+        else:
+            out[f"{prefix}_low_positive_proxy"] = 1.0
+
+        if balance_col in out.columns:
+            balance = pd.to_numeric(out[balance_col], errors="coerce").fillna(0.0)
+            out[f"{prefix}_lm_pos_neg_balance_pos"] = balance.clip(lower=0.0)
+            out[f"{prefix}_lm_pos_neg_balance_neg"] = (-balance).clip(lower=0.0)
+        else:
+            out[f"{prefix}_lm_pos_neg_balance_pos"] = 0.0
+            out[f"{prefix}_lm_pos_neg_balance_neg"] = 0.0
+
+    return out
+
+
+def _prepare_fundamental_features(fund: pd.DataFrame) -> pd.DataFrame:
+    out = fund.copy()
+    out["_join_key"] = out["cik10"].astype(str) + ":" + out["accession_number"].astype(str)
+    return out
+
+
+def join_feature_layers(fundamental: pd.DataFrame, text: pd.DataFrame) -> pd.DataFrame:
+    fund = _prepare_fundamental_features(fundamental)
+    txt = _prepare_text_features(text)
+
+    # If multiple primary documents exist for one accession, keep all rows.
+    # The primary document remains part of the output lineage.
+    joined = txt.merge(
+        fund,
+        on="_join_key",
+        how="inner",
+        suffixes=("_text", "_fund"),
+    )
+    return joined
+
+
+def _get(row: pd.Series, base_col: str) -> Any:
+    """Resolve columns after suffixed join."""
+    for candidate in [base_col, f"{base_col}_text", f"{base_col}_fund"]:
+        if candidate in row.index:
+            return row.get(candidate)
+    return ""
+
+
+def _component_value(row: pd.Series, fund_col: str, text_col: str) -> float | None:
+    f = _to_float(row.get(fund_col, None))
+    t = _to_float(row.get(text_col, None))
+    if f is None or t is None:
+        return None
+    return f * t
+
+
+def _component_set(row: pd.Series, spec: dict[str, tuple[str, str]], prefix: str) -> tuple[dict[str, Any], list[float | None]]:
+    out: dict[str, Any] = {}
+    values: list[float | None] = []
+    for name, (fund_col, text_col) in spec.items():
+        value = _component_value(row, fund_col, text_col)
+        out[f"{prefix}_{name}"] = _round_or_none(value)
+        out[f"{prefix}_{name}_fund_col"] = fund_col
+        out[f"{prefix}_{name}_text_col"] = text_col
+        values.append(value)
+    return out, values
+
+
+def _quality_flag(row: pd.Series, downside_valid: int, upside_valid: int, config: MismatchFeaturesConfig) -> tuple[str, str]:
+    notes: list[str] = []
+
+    fund_flag = str(_get(row, "fundamental_composite_quality_flag") or "").upper()
+    full_parse_flag = str(_get(row, "full_parse_quality_flag") or "").upper()
+    mda_flag = str(_get(row, "mda_section_quality_flag") or "").upper()
+    risk_flag = str(_get(row, "risk_section_quality_flag") or "").upper()
+    liquidity_flag = str(_get(row, "liquidity_section_quality_flag") or "").upper()
+    timestamp_flag = str(_get(row, "timestamp_quality_flag") or "").upper()
+
+    if fund_flag == "RED":
+        notes.append("fundamental_composite_quality_red")
+    elif fund_flag == "YELLOW":
+        notes.append("fundamental_composite_quality_yellow")
+
+    if full_parse_flag == "RED":
+        notes.append("full_text_parse_quality_red")
+    elif full_parse_flag == "YELLOW":
+        notes.append("full_text_parse_quality_yellow")
+
+    for section_name, flag in [
+        ("mda", mda_flag),
+        ("risk", risk_flag),
+        ("liquidity", liquidity_flag),
+    ]:
+        if flag == "RED":
+            notes.append(f"{section_name}_section_quality_red")
+        elif flag == "YELLOW":
+            notes.append(f"{section_name}_section_quality_yellow")
+
+    if timestamp_flag == "RED":
+        notes.append("timestamp_quality_red")
+    elif timestamp_flag == "YELLOW":
+        notes.append("timestamp_quality_yellow")
+
+    if downside_valid < config.min_downside_components:
+        notes.append(f"low_downside_component_count={downside_valid}")
+    if upside_valid < config.min_upside_components:
+        notes.append(f"low_upside_component_count={upside_valid}")
+
+    if any(note.endswith("_red") or "_red" in note for note in notes):
+        return "RED", ";".join(notes)
+    if notes:
+        return "YELLOW", ";".join(notes)
+    return "GREEN", ""
+
+
+def build_mismatch_row(row: pd.Series, config: MismatchFeaturesConfig) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "cik": _get(row, "cik"),
+        "cik10": _get(row, "cik10"),
+        "accession_number": _get(row, "accession_number"),
+        "primary_document": _get(row, "primary_document"),
+        "accession_lineage_key": _get(row, "accession_lineage_key"),
+        "feature_asof_date": _get(row, "feature_asof_date"),
+        "accepted_at_edgar": _get(row, "accepted_at_edgar"),
+        "timestamp_quality_flag": _get(row, "timestamp_quality_flag"),
+        "fundamental_composite_quality_flag": _get(row, "fundamental_composite_quality_flag"),
+        "full_parse_quality_flag": _get(row, "full_parse_quality_flag"),
+        "mda_section_quality_flag": _get(row, "mda_section_quality_flag"),
+        "risk_section_quality_flag": _get(row, "risk_section_quality_flag"),
+        "liquidity_section_quality_flag": _get(row, "liquidity_section_quality_flag"),
+        "fund_stress_score": _round_or_none(_to_float(row.get("fund_stress_score"))),
+        "fund_improve_score": _round_or_none(_to_float(row.get("fund_improve_score"))),
+        "fund_net_stress_score": _round_or_none(_to_float(row.get("fund_net_stress_score"))),
+        "fund_net_improvement_score": _round_or_none(_to_float(row.get("fund_net_improvement_score"))),
+        "fundamental_reality_score": _round_or_none(_to_float(row.get("fundamental_reality_score"))),
+        "mismatch_feature_version": config.feature_version,
+    }
+
+    downside_data, downside_values = _component_set(row, DOWNSIDE_COMPONENTS, "downside")
+    upside_data, upside_values = _component_set(row, UPSIDE_COMPONENTS, "upside")
+    out.update(downside_data)
+    out.update(upside_data)
+
+    downside_score = _mean_nonmissing(downside_values)
+    upside_score = _mean_nonmissing(upside_values)
+
+    downside_valid = sum(v is not None for v in downside_values)
+    upside_valid = sum(v is not None for v in upside_values)
+
+    out["downside_mismatch_score"] = _round_or_none(downside_score)
+    out["upside_mismatch_score"] = _round_or_none(upside_score)
+    out["net_mismatch_score"] = _round_or_none((upside_score or 0.0) - (downside_score or 0.0)) if downside_score is not None or upside_score is not None else None
+    out["dfm_score_simple"] = out["net_mismatch_score"]
+    out["downside_component_valid_count"] = downside_valid
+    out["upside_component_valid_count"] = upside_valid
+    out["downside_component_coverage_ratio"] = downside_valid / len(DOWNSIDE_COMPONENTS)
+    out["upside_component_coverage_ratio"] = upside_valid / len(UPSIDE_COMPONENTS)
+
+    qflag, qnotes = _quality_flag(row, downside_valid, upside_valid, config)
+    out["mismatch_quality_flag"] = qflag
+    out["mismatch_quality_notes"] = qnotes
+
+    # Carry selected source features for auditability.
+    audit_columns = [
+        "full_lm_positive_share",
+        "full_lm_negative_share",
+        "full_lm_uncertainty_share",
+        "full_lm_litigious_share",
+        "full_lm_constraining_share",
+        "full_lm_modal_total_share",
+        "full_lm_pos_neg_balance",
+        "mda_lm_positive_share",
+        "mda_lm_negative_share",
+        "mda_lm_uncertainty_share",
+        "risk_lm_negative_share",
+        "risk_lm_litigious_share",
+        "risk_lm_constraining_share",
+        "liquidity_lm_negative_share",
+        "stress_margin_deterioration_pos",
+        "stress_cfo_quality_deterioration_pos",
+        "stress_cash_conversion_deterioration_pos",
+        "stress_leverage_increase_pos",
+        "stress_receivables_intensity_increase_pos",
+        "stress_inventory_intensity_increase_pos",
+        "stress_share_dilution_pos",
+        "improve_margin_improvement_pos",
+        "improve_cfo_quality_improvement_pos",
+        "improve_cash_conversion_improvement_pos",
+        "improve_leverage_decline_pos",
+        "improve_cash_buffer_improvement_pos",
+        "improve_working_capital_proxy_improvement_pos",
+    ]
+    for col in audit_columns:
+        if col in row.index:
+            out[col] = _round_or_none(_to_float(row.get(col)))
+
+    return out
+
+
+def build_mismatch_features_dataframe(config: MismatchFeaturesConfig) -> pd.DataFrame:
+    fund = read_table(config.fundamental_composite_features_path)
+    text = read_table(config.text_features_path)
+
+    if fund.empty or text.empty:
+        return pd.DataFrame()
+
+    joined = join_feature_layers(fund, text)
+    rows = [build_mismatch_row(row, config) for _, row in joined.iterrows()]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["cik10", "accession_number", "primary_document"]).reset_index(drop=True)
+    return df
+
+
+def build_mismatch_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame([{"diagnostic": "rows", "value": 0}])
+
+    rows: list[dict[str, Any]] = [
+        {"diagnostic": "rows", "value": len(df)},
+        {"diagnostic": "distinct_cik10", "value": df["cik10"].nunique() if "cik10" in df else 0},
+        {"diagnostic": "mean_downside_mismatch_score", "value": pd.to_numeric(df["downside_mismatch_score"], errors="coerce").mean()},
+        {"diagnostic": "mean_upside_mismatch_score", "value": pd.to_numeric(df["upside_mismatch_score"], errors="coerce").mean()},
+        {"diagnostic": "mean_net_mismatch_score", "value": pd.to_numeric(df["net_mismatch_score"], errors="coerce").mean()},
+    ]
+
+    if "mismatch_quality_flag" in df:
+        for flag, count in df["mismatch_quality_flag"].value_counts(dropna=False).items():
+            rows.append({"diagnostic": f"mismatch_quality_flag_{flag}", "value": int(count)})
+
+    return pd.DataFrame(rows)
+
+
+def write_mismatch_outputs(
+    df: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    *,
+    output_table_path: str | Path,
+    output_csv_path: str | Path,
+    diagnostics_path: str | Path,
+) -> None:
+    safe_write_table(df, parquet_path=output_table_path, csv_path=output_csv_path)
+    diagnostics_path = Path(diagnostics_path)
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics.to_csv(diagnostics_path, index=False)
+
+
+def build_mismatch_features_asof(config: MismatchFeaturesConfig) -> pd.DataFrame:
+    logger = get_logger(
+        "fvn_dfm.mismatch_features_asof",
+        root() / "logs/pipeline/mismatch_features_asof.log",
+    )
+    logger.info(
+        "Building Disclosure-Fundamental Mismatch features from %s and %s",
+        config.fundamental_composite_features_path,
+        config.text_features_path,
+    )
+    df = build_mismatch_features_dataframe(config)
+    diagnostics = build_mismatch_diagnostics(df)
+    write_mismatch_outputs(
+        df,
+        diagnostics,
+        output_table_path=config.output_table_path,
+        output_csv_path=config.output_csv_path,
+        diagnostics_path=config.diagnostics_path,
+    )
+    logger.info("Wrote %d mismatch feature rows to %s", len(df), config.output_table_path)
+    return df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build Disclosure-Fundamental Mismatch features.")
+    parser.add_argument("--fundamental-composite-features-path", default="data/processed/features/fundamental_composite_features_asof.csv")
+    parser.add_argument("--text-features-path", default="data/processed/features/text_features_asof.csv")
+    parser.add_argument("--output-table", default="data/processed/features/mismatch_features_asof.parquet")
+    parser.add_argument("--output-csv", default="data/processed/features/mismatch_features_asof.csv")
+    parser.add_argument("--diagnostics-path", default="outputs/diagnostics/mismatch_features_asof_diagnostics.csv")
+    parser.add_argument("--min-downside-components", type=int, default=8)
+    parser.add_argument("--min-upside-components", type=int, default=6)
+    args = parser.parse_args()
+
+    config = MismatchFeaturesConfig(
+        fundamental_composite_features_path=root() / args.fundamental_composite_features_path,
+        text_features_path=root() / args.text_features_path,
+        output_table_path=root() / args.output_table,
+        output_csv_path=root() / args.output_csv,
+        diagnostics_path=root() / args.diagnostics_path,
+        min_downside_components=args.min_downside_components,
+        min_upside_components=args.min_upside_components,
+    )
+    build_mismatch_features_asof(config)
+
+
+if __name__ == "__main__":
+    main()

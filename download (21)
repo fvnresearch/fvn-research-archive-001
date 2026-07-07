@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from fvn_dfm.data_ingestion.loughran_mcdonald import load_lm_lexicon
+from fvn_dfm.text.lm_dictionary_features import compute_lm_feature_dict
+from fvn_dfm.utils.logging import get_logger
+from fvn_dfm.utils.paths import root
+
+
+TEXT_FEATURE_VERSION = "TEXT_FEATURES_ASOF_V1"
+
+SECTION_PREFIX = {
+    "mda": "mda_",
+    "risk_factors": "risk_",
+    "liquidity": "liquidity_",
+}
+
+
+@dataclass(frozen=True)
+class TextFeaturesConfig:
+    filing_text_raw_path: Path
+    filing_section_text_path: Path
+    filing_availability_path: Path | None
+    lm_dictionary_path: Path
+    output_table_path: Path
+    output_csv_path: Path
+    feature_version: str = TEXT_FEATURE_VERSION
+
+
+def read_table(path: str | Path) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Input table not found: {p}")
+    if p.suffix == ".parquet":
+        return pd.read_parquet(p)
+    return pd.read_csv(p, dtype=str).fillna("")
+
+
+def _safe_text(value: Any) -> str:
+    return "" if value is None or pd.isna(value) else str(value)
+
+
+def _key_columns(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "cik": row.get("cik", ""),
+        "cik10": row.get("cik10", ""),
+        "accession_number": row.get("accession_number", ""),
+        "primary_document": row.get("primary_document", ""),
+        "accession_lineage_key": row.get("accession_lineage_key", ""),
+    }
+
+
+def _availability_lookup(path: str | Path | None) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    df = read_table(p)
+    lookup: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        cik10 = str(row.get("cik10", "") or "")
+        accession = str(row.get("accession_number", "") or "")
+        accession_key = f"{cik10}:{accession}"
+        if cik10 and accession:
+            lookup[accession_key] = row.to_dict()
+        lineage_key = str(row.get("accession_lineage_key", "") or "")
+        if lineage_key:
+            lookup[lineage_key] = row.to_dict()
+    return lookup
+
+
+def _find_availability_for_text_row(row: dict[str, Any], lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    full_key = str(row.get("accession_lineage_key", "") or "")
+    cik10 = str(row.get("cik10", "") or "")
+    accession = str(row.get("accession_number", "") or "")
+    accession_key = f"{cik10}:{accession}"
+
+    if accession_key in lookup:
+        return lookup[accession_key]
+    if full_key in lookup:
+        return lookup[full_key]
+    return {}
+
+
+def build_text_features_asof_dataframe(config: TextFeaturesConfig) -> pd.DataFrame:
+    lexicon = load_lm_lexicon(config.lm_dictionary_path)
+    full_df = read_table(config.filing_text_raw_path)
+    section_df = read_table(config.filing_section_text_path)
+    availability = _availability_lookup(config.filing_availability_path)
+
+    section_groups: dict[str, pd.DataFrame] = {}
+    if not section_df.empty:
+        for lineage_key, group in section_df.groupby("accession_lineage_key"):
+            section_groups[str(lineage_key)] = group
+
+    rows: list[dict[str, Any]] = []
+
+    for _, source_row in full_df.iterrows():
+        row_dict = source_row.to_dict()
+        lineage_key = str(row_dict.get("accession_lineage_key", "") or "")
+        out: dict[str, Any] = _key_columns(row_dict)
+
+        availability_row = _find_availability_for_text_row(row_dict, availability)
+        out["feature_asof_date"] = availability_row.get("first_allowed_execution_date", "")
+        out["accepted_at_edgar"] = availability_row.get("accepted_at_edgar", "")
+        out["timestamp_quality_flag"] = availability_row.get("timestamp_quality_flag", "")
+        out["text_feature_version"] = config.feature_version
+        out["full_parse_quality_flag"] = row_dict.get("parse_quality_flag", "")
+        out["full_parse_quality_notes"] = row_dict.get("parse_quality_notes", "")
+        out["full_clean_char_count"] = row_dict.get("clean_char_count", 0)
+        out["full_clean_word_count_source"] = row_dict.get("clean_word_count", 0)
+
+        out.update(compute_lm_feature_dict(_safe_text(row_dict.get("clean_text")), lexicon, prefix="full_"))
+
+        sections = section_groups.get(lineage_key)
+        available_sections: set[str] = set()
+        if sections is not None:
+            for _, section_row in sections.iterrows():
+                section_name = str(section_row.get("section_name", "") or "")
+                prefix = SECTION_PREFIX.get(section_name)
+                if not prefix:
+                    continue
+                available_sections.add(section_name)
+                out[f"{prefix}section_quality_flag"] = section_row.get("section_quality_flag", "")
+                out[f"{prefix}section_quality_notes"] = section_row.get("section_quality_notes", "")
+                out[f"{prefix}section_word_count_source"] = section_row.get("section_word_count", 0)
+                out.update(
+                    compute_lm_feature_dict(
+                        _safe_text(section_row.get("section_text")),
+                        lexicon,
+                        prefix=prefix,
+                    )
+                )
+
+        for section_name, prefix in SECTION_PREFIX.items():
+            out[f"{prefix}section_available"] = section_name in available_sections
+            if section_name not in available_sections:
+                out[f"{prefix}section_quality_flag"] = "RED"
+                out[f"{prefix}section_quality_notes"] = "section_missing_from_filing_section_text"
+                out[f"{prefix}section_word_count_source"] = 0
+                out.update(compute_lm_feature_dict("", lexicon, prefix=prefix))
+
+        rows.append(out)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["cik10", "accession_number", "primary_document"]).reset_index(drop=True)
+    return df
+
+
+def write_text_features_asof_outputs(df: pd.DataFrame, *, output_table_path: str | Path, output_csv_path: str | Path) -> None:
+    output_table_path = Path(output_table_path)
+    output_csv_path = Path(output_csv_path)
+    output_table_path.parent.mkdir(parents=True, exist_ok=True)
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(output_table_path, index=False)
+    df.to_csv(output_csv_path, index=False)
+
+
+def build_text_features_asof(config: TextFeaturesConfig) -> pd.DataFrame:
+    logger = get_logger(
+        "fvn_dfm.text_features_asof",
+        root() / "logs/pipeline/text_features_asof.log",
+    )
+    logger.info("Building text_features_asof from %s and %s", config.filing_text_raw_path, config.filing_section_text_path)
+    df = build_text_features_asof_dataframe(config)
+    write_text_features_asof_outputs(df, output_table_path=config.output_table_path, output_csv_path=config.output_csv_path)
+    logger.info("Wrote %d text feature rows to %s", len(df), config.output_table_path)
+    return df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build text_features_asof from filing text and LM dictionary.")
+    parser.add_argument("--filing-text-raw-path", default="data/processed/source_tables/filing_text_raw.csv")
+    parser.add_argument("--filing-section-text-path", default="data/processed/source_tables/filing_section_text.csv")
+    parser.add_argument("--filing-availability-path", default="data/processed/point_in_time/filing_availability.csv")
+    parser.add_argument("--lm-dictionary-path", default="data/raw/dictionaries/loughran_mcdonald")
+    parser.add_argument("--output-table", default="data/processed/features/text_features_asof.parquet")
+    parser.add_argument("--output-csv", default="data/processed/features/text_features_asof.csv")
+    args = parser.parse_args()
+
+    config = TextFeaturesConfig(
+        filing_text_raw_path=root() / args.filing_text_raw_path,
+        filing_section_text_path=root() / args.filing_section_text_path,
+        filing_availability_path=root() / args.filing_availability_path if args.filing_availability_path else None,
+        lm_dictionary_path=root() / args.lm_dictionary_path,
+        output_table_path=root() / args.output_table,
+        output_csv_path=root() / args.output_csv,
+    )
+    build_text_features_asof(config)
+
+
+if __name__ == "__main__":
+    main()

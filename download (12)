@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import csv
+import uuid
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fvn_dfm.utils.checksums import sha256_file
+
+
+MANIFEST_COLUMNS = [
+    "raw_file_id",
+    "source_family",
+    "source_name",
+    "source_url_or_origin",
+    "downloaded_at_utc",
+    "source_vintage_date",
+    "file_name",
+    "file_path_local",
+    "file_extension",
+    "file_size_bytes",
+    "sha256_checksum",
+    "compression_type",
+    "record_count_if_known",
+    "date_range_start",
+    "date_range_end",
+    "download_status",
+    "http_status_code",
+    "retry_count",
+    "immutable_flag",
+    "notes",
+]
+
+
+@dataclass(frozen=True)
+class RawManifestRecord:
+    raw_file_id: str
+    source_family: str
+    source_name: str
+    source_url_or_origin: str
+    downloaded_at_utc: str
+    source_vintage_date: str
+    file_name: str
+    file_path_local: str
+    file_extension: str
+    file_size_bytes: int
+    sha256_checksum: str
+    compression_type: str
+    record_count_if_known: str
+    date_range_start: str
+    date_range_end: str
+    download_status: str
+    http_status_code: str
+    retry_count: int
+    immutable_flag: bool
+    notes: str
+
+    @classmethod
+    def from_downloaded_file(
+        cls,
+        *,
+        path: str | Path,
+        source_family: str,
+        source_name: str,
+        source_url_or_origin: str,
+        source_vintage_date: str = "",
+        compression_type: str = "",
+        record_count_if_known: str = "",
+        date_range_start: str = "",
+        date_range_end: str = "",
+        download_status: str = "success",
+        http_status_code: int | str = "",
+        retry_count: int = 0,
+        notes: str = "",
+    ) -> "RawManifestRecord":
+        p = Path(path)
+        return cls(
+            raw_file_id=str(uuid.uuid4()),
+            source_family=source_family,
+            source_name=source_name,
+            source_url_or_origin=source_url_or_origin,
+            downloaded_at_utc=datetime.now(timezone.utc).isoformat(),
+            source_vintage_date=source_vintage_date,
+            file_name=p.name,
+            file_path_local=str(p),
+            file_extension=p.suffix.lstrip("."),
+            file_size_bytes=p.stat().st_size,
+            sha256_checksum=sha256_file(p),
+            compression_type=compression_type,
+            record_count_if_known=str(record_count_if_known),
+            date_range_start=date_range_start,
+            date_range_end=date_range_end,
+            download_status=download_status,
+            http_status_code=str(http_status_code),
+            retry_count=retry_count,
+            immutable_flag=True,
+            notes=notes,
+        )
+
+
+class RawFileManifest:
+    """Append-only raw file manifest.
+
+    The manifest is intentionally append-only. If a downloaded file changes,
+    create a new raw file and a new manifest row. Do not mutate historical rows.
+    """
+
+    def __init__(self, manifest_path: str | Path) -> None:
+        self.path = Path(manifest_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            with self.path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+                writer.writeheader()
+
+    def read_records(self) -> list[dict[str, Any]]:
+        with self.path.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def append(self, record: RawManifestRecord) -> None:
+        row = asdict(record)
+        existing = self.read_records()
+
+        # Immutable duplicate protection: same local path + checksum should not be appended twice.
+        for prior in existing:
+            same_path = prior.get("file_path_local") == row["file_path_local"]
+            same_hash = prior.get("sha256_checksum") == row["sha256_checksum"]
+            if same_path and same_hash:
+                return
+
+        with self.path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+            writer.writerow(row)
+
+    def has_source_url(self, source_url: str) -> bool:
+        return any(r.get("source_url_or_origin") == source_url for r in self.read_records())
+
+    def validate(self) -> None:
+        records = self.read_records()
+        seen_ids: set[str] = set()
+        for i, row in enumerate(records, start=1):
+            for col in MANIFEST_COLUMNS:
+                if col not in row:
+                    raise ValueError(f"Manifest row {i} missing column {col}")
+            raw_file_id = row["raw_file_id"]
+            if raw_file_id in seen_ids:
+                raise ValueError(f"Duplicate raw_file_id: {raw_file_id}")
+            seen_ids.add(raw_file_id)
+            local = Path(row["file_path_local"])
+            if row["download_status"] == "success" and not local.exists():
+                raise FileNotFoundError(f"Manifested file missing: {local}")
+            if row["download_status"] == "success" and local.exists():
+                actual = sha256_file(local)
+                if actual != row["sha256_checksum"]:
+                    raise ValueError(f"Checksum mismatch for {local}")

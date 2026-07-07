@@ -1,0 +1,505 @@
+from __future__ import annotations
+
+import argparse
+import io
+import re
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+import requests
+
+from fvn_dfm.data_ingestion.raw_manifest import RawFileManifest, RawManifestRecord
+from fvn_dfm.utils.config import load_yaml
+from fvn_dfm.utils.io import ensure_dir
+from fvn_dfm.utils.logging import get_logger
+from fvn_dfm.utils.paths import root
+
+
+FSDS_ZIP_RE = re.compile(r"(?P<year>\d{4})q(?P<quarter>[1-4])\.zip$", re.IGNORECASE)
+FSDS_REQUIRED_FILES = ("sub.txt", "num.txt", "tag.txt", "pre.txt")
+
+
+@dataclass(frozen=True)
+class FSDSDownloadConfig:
+    storage_dir: Path
+    manifest_path: Path
+    user_agent: str
+    max_requests_per_second: float
+    retry_count: int
+    retry_backoff_seconds: list[int]
+    url_template: str = "https://www.sec.gov/files/dera/data/financial-statement-data-sets/{year}q{quarter}.zip"
+
+
+@dataclass(frozen=True)
+class FSDSIngestionConfig:
+    raw_fsds_dir: Path
+    output_dir: Path
+    diagnostics_dir: Path
+    years: tuple[int, ...] | None = None
+    quarters: tuple[int, ...] | None = None
+    forms_filter: tuple[str, ...] = ("10-K", "10-Q")
+    chunksize: int = 250_000
+
+
+def quarter_label(year: int, quarter: int) -> str:
+    if quarter not in {1, 2, 3, 4}:
+        raise ValueError("quarter must be 1..4")
+    return f"{year}q{quarter}"
+
+
+def fsds_zip_url(year: int, quarter: int, template: str | None = None) -> str:
+    template = template or "https://www.sec.gov/files/dera/data/financial-statement-data-sets/{year}q{quarter}.zip"
+    return template.format(year=year, quarter=quarter)
+
+
+def parse_fsds_zip_label(path: str | Path) -> tuple[int, int]:
+    match = FSDS_ZIP_RE.search(Path(path).name)
+    if not match:
+        raise ValueError(f"Cannot parse SEC FSDS quarter from filename: {path}")
+    return int(match.group("year")), int(match.group("quarter"))
+
+
+def find_fsds_zip_files(raw_fsds_dir: str | Path, *, years: Iterable[int] | None = None, quarters: Iterable[int] | None = None) -> list[Path]:
+    p = Path(raw_fsds_dir)
+    year_set = set(years) if years else None
+    quarter_set = set(quarters) if quarters else None
+    files: list[Path] = []
+
+    for file_path in sorted(p.glob("*.zip")):
+        try:
+            year, quarter = parse_fsds_zip_label(file_path)
+        except ValueError:
+            continue
+        if year_set and year not in year_set:
+            continue
+        if quarter_set and quarter not in quarter_set:
+            continue
+        files.append(file_path)
+    return files
+
+
+def validate_fsds_zip(path: str | Path) -> None:
+    p = Path(path)
+    with zipfile.ZipFile(p) as zf:
+        names = {Path(name).name.lower() for name in zf.namelist()}
+    missing = set(FSDS_REQUIRED_FILES).difference(names)
+    if missing:
+        raise ValueError(f"SEC FSDS zip {p} missing required files: {sorted(missing)}")
+
+
+def safe_write_table(df: pd.DataFrame, *, parquet_path: str | Path, csv_path: str | Path) -> None:
+    """Write CSV always and Parquet when an engine is available.
+
+    The project requirements pin pyarrow for production. The fallback keeps tests
+    and lightweight local audits runnable in environments where pyarrow is absent.
+    """
+    parquet_path = Path(parquet_path)
+    csv_path = Path(csv_path)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(csv_path, index=False)
+    try:
+        df.to_parquet(parquet_path, index=False)
+    except ImportError as exc:
+        marker = parquet_path.with_suffix(parquet_path.suffix + ".unavailable.txt")
+        marker.write_text(
+            "Parquet output was not written because no parquet engine was available. "
+            "Install pyarrow or fastparquet. CSV output was written successfully.\n"
+            f"Original error: {exc}\n",
+            encoding="utf-8",
+        )
+
+
+def load_fsds_download_config(config_path: str | Path) -> FSDSDownloadConfig:
+    cfg = load_yaml(config_path)
+    sec = cfg["sec"]
+    policy = sec["request_policy"]
+    raw_storage = sec["raw_storage"]
+
+    user_agent = policy["user_agent"]
+    if "to_be_set" in user_agent.lower():
+        raise ValueError(
+            "SEC User-Agent is not set. Edit configs/01_data_sources.yaml "
+            "and replace 'contact_email_to_be_set' before downloading."
+        )
+
+    return FSDSDownloadConfig(
+        storage_dir=root() / raw_storage["financial_statement_data_sets"],
+        manifest_path=root() / "data/manifests/raw_file_manifest.csv",
+        user_agent=user_agent,
+        max_requests_per_second=float(policy.get("max_requests_per_second", 5)),
+        retry_count=int(policy.get("retry_count", 5)),
+        retry_backoff_seconds=list(policy.get("retry_backoff_seconds", [1, 2, 5, 10, 30])),
+    )
+
+
+class SECFinancialStatementDataSetsDownloader:
+    """Downloader for SEC Financial Statement Data Sets quarterly ZIP files."""
+
+    def __init__(self, config: FSDSDownloadConfig) -> None:
+        self.config = config
+        self.storage_dir = ensure_dir(config.storage_dir)
+        self.manifest = RawFileManifest(config.manifest_path)
+        self.logger = get_logger(
+            "fvn_dfm.sec_fsds_download",
+            root() / "logs/pipeline/sec_financial_statement_data_sets_download.log",
+        )
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": config.user_agent,
+                "Accept-Encoding": "gzip, deflate",
+                "Accept": "application/zip,application/octet-stream,*/*",
+            }
+        )
+        self._min_interval = 1.0 / max(config.max_requests_per_second, 0.1)
+        self._last_request_ts = 0.0
+
+    def _throttle(self) -> None:
+        elapsed = time.time() - self._last_request_ts
+        sleep_for = self._min_interval - elapsed
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        self._last_request_ts = time.time()
+
+    def _request(self, url: str) -> tuple[requests.Response, int]:
+        last_response: requests.Response | None = None
+        for attempt in range(self.config.retry_count + 1):
+            self._throttle()
+            response = self.session.get(url, timeout=90)
+            last_response = response
+            if response.status_code == 200:
+                return response, attempt
+            if response.status_code in {403, 404}:
+                return response, attempt
+            if attempt < self.config.retry_count:
+                backoff = self.config.retry_backoff_seconds[
+                    min(attempt, len(self.config.retry_backoff_seconds) - 1)
+                ]
+                time.sleep(backoff)
+        assert last_response is not None
+        return last_response, self.config.retry_count
+
+    def download_quarter(self, year: int, quarter: int, *, force: bool = False) -> Path | None:
+        label = quarter_label(year, quarter)
+        url = fsds_zip_url(year, quarter, self.config.url_template)
+        output_path = self.storage_dir / f"{label}.zip"
+
+        if output_path.exists() and not force:
+            self.logger.info("Skipping existing immutable FSDS zip: %s", output_path)
+            return output_path
+
+        if output_path.exists() and force:
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            output_path = self.storage_dir / f"{label}.{timestamp}.zip"
+
+        response, retry_count = self._request(url)
+        if response.status_code != 200:
+            self.logger.warning("FSDS download failed for %s | HTTP %s", label, response.status_code)
+            return None
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                names = {Path(name).name.lower() for name in zf.namelist()}
+                missing = set(FSDS_REQUIRED_FILES).difference(names)
+                if missing:
+                    raise ValueError(f"downloaded FSDS zip missing files: {sorted(missing)}")
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"Downloaded SEC FSDS payload for {label} is not a valid zip") from exc
+
+        output_path.write_bytes(response.content)
+
+        record = RawManifestRecord.from_downloaded_file(
+            path=output_path,
+            source_family="sec_financial_statement_data_sets",
+            source_name="SEC Financial Statement Data Sets quarterly zip",
+            source_url_or_origin=url,
+            source_vintage_date=label,
+            compression_type="zip",
+            download_status="success",
+            http_status_code=response.status_code,
+            retry_count=retry_count,
+            notes=f"year={year}; quarter={quarter}",
+        )
+        self.manifest.append(record)
+        self.manifest.validate()
+        self.logger.info("Downloaded SEC FSDS %s to %s", label, output_path)
+        return output_path
+
+    def download_many(self, years: Iterable[int], quarters: Iterable[int] = (1, 2, 3, 4), *, force: bool = False) -> list[Path]:
+        paths: list[Path] = []
+        for year in years:
+            for quarter in quarters:
+                path = self.download_quarter(int(year), int(quarter), force=force)
+                if path is not None:
+                    paths.append(path)
+        return paths
+
+
+def _read_tsv_from_zip(zip_path: Path, member_name: str, *, dtype: dict[str, str] | None = None) -> pd.DataFrame:
+    with zipfile.ZipFile(zip_path) as zf:
+        members = {Path(name).name.lower(): name for name in zf.namelist()}
+        key = member_name.lower()
+        if key not in members:
+            raise ValueError(f"{zip_path} missing member {member_name}")
+        with zf.open(members[key]) as f:
+            return pd.read_csv(f, sep="\t", dtype=dtype, low_memory=False)
+
+
+def _read_num_from_zip_filtered(
+    zip_path: Path,
+    *,
+    allowed_adsh: set[str] | None = None,
+    chunksize: int = 250_000,
+) -> pd.DataFrame:
+    dtype = {
+        "adsh": "string",
+        "tag": "string",
+        "version": "string",
+        "coreg": "string",
+        "uom": "string",
+        "footnote": "string",
+    }
+    chunks: list[pd.DataFrame] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        members = {Path(name).name.lower(): name for name in zf.namelist()}
+        if "num.txt" not in members:
+            raise ValueError(f"{zip_path} missing member num.txt")
+        with zf.open(members["num.txt"]) as f:
+            for chunk in pd.read_csv(f, sep="\t", dtype=dtype, chunksize=chunksize, low_memory=False):
+                if allowed_adsh is not None:
+                    chunk = chunk[chunk["adsh"].isin(allowed_adsh)]
+                if not chunk.empty:
+                    chunks.append(chunk)
+    if not chunks:
+        return pd.DataFrame()
+    return pd.concat(chunks, ignore_index=True)
+
+
+def _normalize_sub(sub: pd.DataFrame, *, source_zip: Path, year: int, quarter: int, forms_filter: tuple[str, ...]) -> pd.DataFrame:
+    out = sub.copy()
+    out.columns = [c.strip().lower() for c in out.columns]
+    if "adsh" not in out.columns:
+        raise ValueError(f"sub.txt in {source_zip} missing adsh column")
+
+    if "form" in out.columns and forms_filter:
+        allowed = {f.upper() for f in forms_filter}
+        out = out[out["form"].astype(str).str.upper().isin(allowed)].copy()
+
+    out["fsds_year"] = year
+    out["fsds_quarter"] = quarter
+    out["fsds_quarter_label"] = quarter_label(year, quarter)
+    out["source_zip"] = str(source_zip)
+    return out
+
+
+def _normalize_num(num: pd.DataFrame, *, source_zip: Path, year: int, quarter: int) -> pd.DataFrame:
+    out = num.copy()
+    out.columns = [c.strip().lower() for c in out.columns]
+    if out.empty:
+        return out
+    out["fsds_year"] = year
+    out["fsds_quarter"] = quarter
+    out["fsds_quarter_label"] = quarter_label(year, quarter)
+    out["source_zip"] = str(source_zip)
+    return out
+
+
+def _normalize_aux(df: pd.DataFrame, *, source_zip: Path, year: int, quarter: int) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [c.strip().lower() for c in out.columns]
+    out["fsds_year"] = year
+    out["fsds_quarter"] = quarter
+    out["fsds_quarter_label"] = quarter_label(year, quarter)
+    out["source_zip"] = str(source_zip)
+    return out
+
+
+def ingest_fsds_zip(zip_path: str | Path, *, forms_filter: tuple[str, ...] = ("10-K", "10-Q"), chunksize: int = 250_000) -> dict[str, pd.DataFrame]:
+    p = Path(zip_path)
+    validate_fsds_zip(p)
+    year, quarter = parse_fsds_zip_label(p)
+
+    sub = _read_tsv_from_zip(p, "sub.txt", dtype={"adsh": "string", "cik": "string", "form": "string"})
+    sub = _normalize_sub(sub, source_zip=p, year=year, quarter=quarter, forms_filter=forms_filter)
+    allowed_adsh = set(sub["adsh"].dropna().astype(str)) if not sub.empty else set()
+
+    num = _read_num_from_zip_filtered(p, allowed_adsh=allowed_adsh, chunksize=chunksize)
+    num = _normalize_num(num, source_zip=p, year=year, quarter=quarter)
+
+    tag = _read_tsv_from_zip(p, "tag.txt", dtype={"tag": "string", "version": "string"})
+    tag = _normalize_aux(tag, source_zip=p, year=year, quarter=quarter)
+
+    pre = _read_tsv_from_zip(p, "pre.txt", dtype={"adsh": "string", "tag": "string", "version": "string"})
+    if allowed_adsh:
+        pre = pre[pre["adsh"].isin(allowed_adsh)].copy()
+    pre = _normalize_aux(pre, source_zip=p, year=year, quarter=quarter)
+
+    return {
+        "sub": sub,
+        "num": num,
+        "tag": tag,
+        "pre": pre,
+    }
+
+
+def build_fsds_source_tables(config: FSDSIngestionConfig) -> dict[str, pd.DataFrame]:
+    logger = get_logger(
+        "fvn_dfm.sec_fsds_ingestion",
+        root() / "logs/pipeline/sec_financial_statement_data_sets_ingestion.log",
+    )
+
+    zip_files = find_fsds_zip_files(config.raw_fsds_dir, years=config.years, quarters=config.quarters)
+    if not zip_files:
+        raise FileNotFoundError(f"No SEC FSDS quarterly zip files found in {config.raw_fsds_dir}")
+
+    sub_parts: list[pd.DataFrame] = []
+    num_parts: list[pd.DataFrame] = []
+    tag_parts: list[pd.DataFrame] = []
+    pre_parts: list[pd.DataFrame] = []
+    diagnostics: list[dict[str, object]] = []
+
+    for zip_path in zip_files:
+        year, quarter = parse_fsds_zip_label(zip_path)
+        logger.info("Ingesting SEC FSDS %s", zip_path)
+        tables = ingest_fsds_zip(zip_path, forms_filter=config.forms_filter, chunksize=config.chunksize)
+
+        sub_parts.append(tables["sub"])
+        num_parts.append(tables["num"])
+        tag_parts.append(tables["tag"])
+        pre_parts.append(tables["pre"])
+
+        diagnostics.append(
+            {
+                "source_zip": str(zip_path),
+                "fsds_year": year,
+                "fsds_quarter": quarter,
+                "fsds_quarter_label": quarter_label(year, quarter),
+                "sub_rows": len(tables["sub"]),
+                "num_rows": len(tables["num"]),
+                "tag_rows": len(tables["tag"]),
+                "pre_rows": len(tables["pre"]),
+                "distinct_adsh_sub": tables["sub"]["adsh"].nunique() if "adsh" in tables["sub"] else 0,
+                "distinct_adsh_num": tables["num"]["adsh"].nunique() if "adsh" in tables["num"] else 0,
+            }
+        )
+
+    output_dir = ensure_dir(config.output_dir)
+    diagnostics_dir = ensure_dir(config.diagnostics_dir)
+
+    outputs = {
+        "sub": pd.concat(sub_parts, ignore_index=True) if sub_parts else pd.DataFrame(),
+        "num": pd.concat(num_parts, ignore_index=True) if num_parts else pd.DataFrame(),
+        "tag": pd.concat(tag_parts, ignore_index=True).drop_duplicates() if tag_parts else pd.DataFrame(),
+        "pre": pd.concat(pre_parts, ignore_index=True) if pre_parts else pd.DataFrame(),
+    }
+
+    if not outputs["sub"].empty and "adsh" in outputs["sub"].columns:
+        outputs["sub"] = outputs["sub"].sort_values(["fsds_year", "fsds_quarter", "adsh"]).reset_index(drop=True)
+    if not outputs["num"].empty and {"adsh", "tag"}.issubset(outputs["num"].columns):
+        outputs["num"] = outputs["num"].sort_values(["fsds_year", "fsds_quarter", "adsh", "tag"]).reset_index(drop=True)
+    if not outputs["pre"].empty and {"adsh", "report", "line"}.issubset(outputs["pre"].columns):
+        outputs["pre"] = outputs["pre"].sort_values(["fsds_year", "fsds_quarter", "adsh", "report", "line"]).reset_index(drop=True)
+
+    safe_write_table(
+        outputs["sub"],
+        parquet_path=output_dir / "xbrl_submission_metadata.parquet",
+        csv_path=output_dir / "xbrl_submission_metadata.csv",
+    )
+    safe_write_table(
+        outputs["num"],
+        parquet_path=output_dir / "xbrl_fact_accession_raw.parquet",
+        csv_path=output_dir / "xbrl_fact_accession_raw.csv",
+    )
+    safe_write_table(
+        outputs["tag"],
+        parquet_path=output_dir / "xbrl_tag_metadata.parquet",
+        csv_path=output_dir / "xbrl_tag_metadata.csv",
+    )
+    safe_write_table(
+        outputs["pre"],
+        parquet_path=output_dir / "xbrl_presentation_metadata.parquet",
+        csv_path=output_dir / "xbrl_presentation_metadata.csv",
+    )
+
+    diag_df = pd.DataFrame(diagnostics)
+    diag_df.to_csv(diagnostics_dir / "sec_fsds_ingestion_diagnostics.csv", index=False)
+
+    logger.info("Wrote FSDS source tables to %s", output_dir)
+    return outputs
+
+
+def parse_years(value: str | None) -> tuple[int, ...] | None:
+    if not value:
+        return None
+    years: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            years.extend(range(int(start), int(end) + 1))
+        else:
+            years.append(int(part))
+    return tuple(sorted(set(years)))
+
+
+def parse_quarters(value: str | None) -> tuple[int, ...] | None:
+    if not value:
+        return None
+    return tuple(sorted({int(part.strip()) for part in value.split(",") if part.strip()}))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Download or ingest SEC Financial Statement Data Sets.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    download = subparsers.add_parser("download")
+    download.add_argument("--config", default="configs/01_data_sources.yaml")
+    download.add_argument("--years", required=True, help="Example: 2009-2025 or 2024,2025")
+    download.add_argument("--quarters", default="1,2,3,4")
+    download.add_argument("--force", action="store_true")
+
+    ingest = subparsers.add_parser("ingest")
+    ingest.add_argument("--raw-fsds-dir", default="data/raw/sec/financial_statement_data_sets")
+    ingest.add_argument("--output-dir", default="data/processed/source_tables")
+    ingest.add_argument("--diagnostics-dir", default="outputs/diagnostics")
+    ingest.add_argument("--years")
+    ingest.add_argument("--quarters")
+    ingest.add_argument("--forms", default="10-K,10-Q")
+    ingest.add_argument("--chunksize", type=int, default=250000)
+
+    args = parser.parse_args()
+
+    if args.command == "download":
+        cfg = load_fsds_download_config(root() / args.config)
+        downloader = SECFinancialStatementDataSetsDownloader(cfg)
+        downloader.download_many(
+            years=parse_years(args.years) or (),
+            quarters=parse_quarters(args.quarters) or (1, 2, 3, 4),
+            force=args.force,
+        )
+        return
+
+    if args.command == "ingest":
+        config = FSDSIngestionConfig(
+            raw_fsds_dir=root() / args.raw_fsds_dir,
+            output_dir=root() / args.output_dir,
+            diagnostics_dir=root() / args.diagnostics_dir,
+            years=parse_years(args.years),
+            quarters=parse_quarters(args.quarters),
+            forms_filter=tuple(f.strip().upper() for f in args.forms.split(",") if f.strip()),
+            chunksize=args.chunksize,
+        )
+        build_fsds_source_tables(config)
+        return
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,547 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from fvn_dfm.data_ingestion.sec_financial_statement_datasets import safe_write_table
+from fvn_dfm.utils.logging import get_logger
+from fvn_dfm.utils.paths import root
+
+
+LIVE_DATA_READINESS_VERSION = "LIVE_DATA_READINESS_V0"
+
+PLACEHOLDER_PATTERNS = (
+    "contact_email_to_be_set",
+    "to_be_selected_after_audit",
+    "todo",
+    "tbd",
+    "placeholder",
+    "example.com",
+)
+
+
+@dataclass(frozen=True)
+class LiveDataReadinessConfig:
+    repo_root: Path
+    sec_config_path: Path
+    readiness_output_table_path: Path
+    readiness_output_csv_path: Path
+    summary_output_csv_path: Path
+    markdown_report_path: Path
+    diagnostics_path: Path
+    raw_price_path: Path
+    lm_dictionary_dir: Path
+    fsds_raw_dir: Path
+    submissions_raw_dir: Path
+    primary_documents_raw_dir: Path
+    block_on_missing_sec_raw_dirs: bool = False
+    block_on_missing_primary_documents: bool = False
+    block_on_missing_price_data: bool = True
+    block_on_missing_lm_dictionary: bool = True
+    block_on_missing_fsds: bool = True
+    readiness_version: str = LIVE_DATA_READINESS_VERSION
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _looks_placeholder(value: str) -> bool:
+    clean = value.strip().lower()
+    if not clean:
+        return True
+    return any(pattern in clean for pattern in PLACEHOLDER_PATTERNS)
+
+
+def _extract_user_agent(config_text: str) -> str:
+    match = re.search(r"user_agent\s*:\s*[\"']?([^\"'\n#]+)", config_text)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_price_required_fields(config_text: str) -> list[str]:
+    match = re.search(r"price_data:\s*(.*?)(?:\n[a-zA-Z_]+:|\Z)", config_text, flags=re.S)
+    if not match:
+        return []
+    block = match.group(1)
+    req_match = re.search(r"required_fields:\s*(.*?)(?:\n\s*[a-zA-Z_]+:|\Z)", block, flags=re.S)
+    if not req_match:
+        return []
+    fields = []
+    for line in req_match.group(1).splitlines():
+        item = line.strip()
+        if item.startswith("-"):
+            fields.append(item[1:].strip().strip('"').strip("'"))
+    return fields
+
+
+def _directory_has_any_file(path: Path, suffixes: tuple[str, ...] | None = None) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    for child in path.rglob("*"):
+        if child.is_file() and (suffixes is None or child.suffix.lower() in suffixes):
+            return True
+    return False
+
+
+def _result(
+    *,
+    check_id: str,
+    category: str,
+    check_name: str,
+    status: str,
+    blocker: bool,
+    expected: str,
+    observed: Any,
+    message: str,
+    remediation: str,
+    readiness_version: str = LIVE_DATA_READINESS_VERSION,
+) -> dict[str, Any]:
+    return {
+        "check_id": check_id,
+        "category": category,
+        "check_name": check_name,
+        "status": status,
+        "blocker": bool(blocker),
+        "expected": expected,
+        "observed": observed,
+        "message": message,
+        "remediation": remediation,
+        "checked_at_utc": _utc_now(),
+        "readiness_version": readiness_version,
+    }
+
+
+def check_sec_user_agent(config: LiveDataReadinessConfig) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    exists = config.sec_config_path.exists()
+    text = _read_text(config.sec_config_path)
+    user_agent = _extract_user_agent(text)
+
+    rows.append(
+        _result(
+            check_id="SEC_CONFIG_EXISTS",
+            category="sec_compliance",
+            check_name="SEC data-source config exists",
+            status="PASS" if exists else "FAIL",
+            blocker=not exists,
+            expected=str(config.sec_config_path),
+            observed=exists,
+            message="SEC source config file found." if exists else "SEC source config file is missing.",
+            remediation="Restore configs/01_data_sources.yaml before live execution.",
+        )
+    )
+
+    placeholder = _looks_placeholder(user_agent)
+    rows.append(
+        _result(
+            check_id="SEC_USER_AGENT_NOT_PLACEHOLDER",
+            category="sec_compliance",
+            check_name="SEC User-Agent is configured",
+            status="PASS" if user_agent and not placeholder else "FAIL",
+            blocker=not (user_agent and not placeholder),
+            expected="Non-placeholder User-Agent with project/contact identity.",
+            observed=user_agent,
+            message="SEC User-Agent is configured." if user_agent and not placeholder else "SEC User-Agent is missing or still contains a placeholder.",
+            remediation="Set sec.request_policy.user_agent to a descriptive value with contact email before SEC downloads.",
+        )
+    )
+
+    has_contact = ("@" in user_agent) or ("mailto:" in user_agent.lower())
+    rows.append(
+        _result(
+            check_id="SEC_USER_AGENT_CONTACT",
+            category="sec_compliance",
+            check_name="SEC User-Agent includes contact",
+            status="PASS" if has_contact and not placeholder else "FAIL",
+            blocker=not (has_contact and not placeholder),
+            expected="User-Agent includes a contact email or mailto contact.",
+            observed=user_agent,
+            message="SEC User-Agent includes contact details." if has_contact and not placeholder else "SEC User-Agent does not include usable contact details.",
+            remediation="Use a User-Agent such as 'FVN Research contact@example.com'.",
+        )
+    )
+    return rows
+
+
+def check_raw_directories(config: LiveDataReadinessConfig) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    dir_specs = [
+        ("SEC_SUBMISSIONS_RAW_DIR", "sec_raw_inputs", "SEC submissions raw directory", config.submissions_raw_dir, config.block_on_missing_sec_raw_dirs),
+        ("SEC_PRIMARY_DOCUMENTS_RAW_DIR", "sec_raw_inputs", "SEC primary documents raw directory", config.primary_documents_raw_dir, config.block_on_missing_primary_documents),
+        ("SEC_FSDS_RAW_DIR", "accounting_raw_inputs", "SEC Financial Statement Data Sets raw directory", config.fsds_raw_dir, config.block_on_missing_fsds),
+        ("LM_DICTIONARY_RAW_DIR", "text_raw_inputs", "Loughran-McDonald dictionary raw directory", config.lm_dictionary_dir, config.block_on_missing_lm_dictionary),
+    ]
+
+    for check_id, category, name, path, blocker_if_missing in dir_specs:
+        exists = path.exists() and path.is_dir()
+        rows.append(
+            _result(
+                check_id=check_id,
+                category=category,
+                check_name=name,
+                status="PASS" if exists else ("FAIL" if blocker_if_missing else "WARN"),
+                blocker=bool(blocker_if_missing and not exists),
+                expected=str(path),
+                observed=exists,
+                message=f"{name} exists." if exists else f"{name} is missing.",
+                remediation=f"Create/populate {path} before live pipeline execution.",
+            )
+        )
+
+    fsds_has_files = _directory_has_any_file(config.fsds_raw_dir, suffixes=(".zip", ".txt", ".tsv", ".csv"))
+    rows.append(
+        _result(
+            check_id="SEC_FSDS_FILES_AVAILABLE",
+            category="accounting_raw_inputs",
+            check_name="SEC FSDS raw files available",
+            status="PASS" if fsds_has_files else ("FAIL" if config.block_on_missing_fsds else "WARN"),
+            blocker=bool(config.block_on_missing_fsds and not fsds_has_files),
+            expected="At least one SEC FSDS zip/txt/tsv/csv file.",
+            observed=fsds_has_files,
+            message="SEC FSDS files are available." if fsds_has_files else "No SEC FSDS source files found.",
+            remediation="Run/download SEC Financial Statement Data Sets before XBRL/accounting extraction.",
+        )
+    )
+
+    lm_has_files = _directory_has_any_file(config.lm_dictionary_dir, suffixes=(".csv", ".xlsx", ".xls", ".txt"))
+    rows.append(
+        _result(
+            check_id="LM_DICTIONARY_FILES_AVAILABLE",
+            category="text_raw_inputs",
+            check_name="Loughran-McDonald dictionary file available",
+            status="PASS" if lm_has_files else ("FAIL" if config.block_on_missing_lm_dictionary else "WARN"),
+            blocker=bool(config.block_on_missing_lm_dictionary and not lm_has_files),
+            expected="At least one LM dictionary csv/xlsx/xls/txt file.",
+            observed=lm_has_files,
+            message="LM dictionary file is available." if lm_has_files else "No LM dictionary file found.",
+            remediation="Download/freeze the Loughran-McDonald dictionary before text feature construction.",
+        )
+    )
+
+    return rows
+
+
+def _price_schema_check(path: Path, config_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    exists = path.exists() and path.is_file()
+    rows.append(
+        _result(
+            check_id="PRICE_RAW_FILE_AVAILABLE",
+            category="price_raw_inputs",
+            check_name="Raw adjusted price file exists",
+            status="PASS" if exists else "FAIL",
+            blocker=not exists,
+            expected=str(path),
+            observed=exists,
+            message="Raw price file exists." if exists else "Raw price file is missing.",
+            remediation="Provide data/raw/prices/adjusted_prices.csv or override the path for live target construction.",
+        )
+    )
+
+    if not exists:
+        rows.append(
+            _result(
+                check_id="PRICE_RAW_SCHEMA_COMPLETE",
+                category="price_raw_inputs",
+                check_name="Raw adjusted price schema complete",
+                status="FAIL",
+                blocker=True,
+                expected="date + ticker/cik10 + adj_close/adjusted_close and recommended sector.",
+                observed="file_missing",
+                message="Cannot validate price schema because raw price file is missing.",
+                remediation="Provide the raw price CSV with required columns.",
+            )
+        )
+        return rows
+
+    try:
+        sample = pd.read_csv(path, nrows=25)
+        columns = {c.strip().lower() for c in sample.columns}
+    except Exception as exc:
+        rows.append(
+            _result(
+                check_id="PRICE_RAW_SCHEMA_READABLE",
+                category="price_raw_inputs",
+                check_name="Raw adjusted price file is readable",
+                status="FAIL",
+                blocker=True,
+                expected="Readable CSV file.",
+                observed=repr(exc),
+                message="Raw price file could not be read.",
+                remediation="Fix the CSV encoding/delimiter/header before live execution.",
+            )
+        )
+        return rows
+
+    has_date = "date" in columns
+    has_identifier = bool({"ticker", "cik10", "security_id"}.intersection(columns))
+    has_price = bool({"adj_close", "adjusted_close"}.intersection(columns))
+    has_sector = "sector" in columns
+
+    required_ok = has_date and has_identifier and has_price
+    observed = ",".join(sorted(columns))
+    rows.append(
+        _result(
+            check_id="PRICE_RAW_SCHEMA_COMPLETE",
+            category="price_raw_inputs",
+            check_name="Raw adjusted price schema complete",
+            status="PASS" if required_ok else "FAIL",
+            blocker=not required_ok,
+            expected="date + ticker/cik10/security_id + adj_close/adjusted_close.",
+            observed=observed,
+            message="Raw price schema has required fields." if required_ok else "Raw price schema is missing required fields.",
+            remediation="Add date, a security identifier, and adjusted close price columns.",
+        )
+    )
+    rows.append(
+        _result(
+            check_id="PRICE_RAW_SECTOR_AVAILABLE",
+            category="price_raw_inputs",
+            check_name="Price file includes sector",
+            status="PASS" if has_sector else "WARN",
+            blocker=False,
+            expected="sector column recommended for sector-adjusted targets.",
+            observed=has_sector,
+            message="Sector column is available." if has_sector else "Sector column is missing; sector-adjusted targets may degrade or fall back.",
+            remediation="Add sector/GICS mapping before final live research runs.",
+        )
+    )
+    return rows
+
+
+def check_schema_completeness(config: LiveDataReadinessConfig) -> list[dict[str, Any]]:
+    text = _read_text(config.sec_config_path)
+    rows = _price_schema_check(config.raw_price_path, text)
+
+    configured_price_fields = _extract_price_required_fields(text)
+    configured_ok = bool(configured_price_fields)
+    rows.append(
+        _result(
+            check_id="PRICE_CONFIG_REQUIRED_FIELDS_PRESENT",
+            category="config_schema",
+            check_name="Price required fields configured",
+            status="PASS" if configured_ok else "WARN",
+            blocker=False,
+            expected="price_data.required_fields in configs/01_data_sources.yaml",
+            observed=",".join(configured_price_fields),
+            message="Configured price required fields found." if configured_ok else "No configured price required fields found.",
+            remediation="Document required live price schema in configs/01_data_sources.yaml.",
+        )
+    )
+    return rows
+
+
+def build_readiness_dataframe(config: LiveDataReadinessConfig) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    rows.extend(check_sec_user_agent(config))
+    rows.extend(check_raw_directories(config))
+    rows.extend(check_schema_completeness(config))
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["category", "check_id"]).reset_index(drop=True)
+    return out
+
+
+def build_readiness_summary(readiness: pd.DataFrame, config: LiveDataReadinessConfig) -> pd.DataFrame:
+    if readiness.empty:
+        status = "BLOCKED"
+        blockers = 1
+        fails = 1
+        warnings = 0
+    else:
+        blockers = int(((readiness["status"] == "FAIL") & readiness["blocker"].astype(bool)).sum())
+        fails = int((readiness["status"] == "FAIL").sum())
+        warnings = int((readiness["status"] == "WARN").sum())
+        status = "READY" if blockers == 0 and warnings == 0 else ("READY_WITH_WARNINGS" if blockers == 0 else "BLOCKED")
+
+    return pd.DataFrame(
+        [
+            {
+                "live_readiness_status": status,
+                "blocking_failures": blockers,
+                "failures": fails,
+                "warnings": warnings,
+                "checks": len(readiness),
+                "checked_at_utc": _utc_now(),
+                "readiness_version": config.readiness_version,
+            }
+        ]
+    )
+
+
+def build_readiness_diagnostics(readiness: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = [
+        {"diagnostic": "readiness_rows", "value": len(readiness)},
+        {"diagnostic": "summary_rows", "value": len(summary)},
+    ]
+    if not summary.empty:
+        for col in ["live_readiness_status", "blocking_failures", "failures", "warnings", "checks"]:
+            rows.append({"diagnostic": col, "value": summary.iloc[0].get(col, "")})
+    if not readiness.empty:
+        for status, count in readiness["status"].value_counts(dropna=False).items():
+            rows.append({"diagnostic": f"status_{status}", "value": int(count)})
+        for category, count in readiness["category"].value_counts(dropna=False).items():
+            rows.append({"diagnostic": f"category_{category}_checks", "value": int(count)})
+    return pd.DataFrame(rows)
+
+
+def render_markdown_report(readiness: pd.DataFrame, summary: pd.DataFrame) -> str:
+    status = summary.iloc[0]["live_readiness_status"] if not summary.empty else "BLOCKED"
+    lines = [
+        "# Live Data Readiness Report",
+        "",
+        f"Version: `{LIVE_DATA_READINESS_VERSION}`",
+        "",
+        f"Live readiness status: **{status}**",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+    ]
+    if not summary.empty:
+        for key, value in summary.iloc[0].items():
+            lines.append(f"| {key} | {value} |")
+
+    lines.extend(
+        [
+            "",
+            "## Checks",
+            "",
+            "| Category | Check | Status | Blocker | Observed | Remediation |",
+            "|---|---|---:|---:|---|---|",
+        ]
+    )
+    if not readiness.empty:
+        for _, row in readiness.iterrows():
+            lines.append(
+                "| "
+                + f"{row.get('category', '')} | "
+                + f"{row.get('check_name', '')} | "
+                + f"{row.get('status', '')} | "
+                + f"{row.get('blocker', '')} | "
+                + f"{row.get('observed', '')} | "
+                + f"{row.get('remediation', '')} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Live-execution rule",
+            "",
+            "Live execution should be blocked whenever `live_readiness_status == BLOCKED`. A `READY_WITH_WARNINGS` status can be used for dry-runs or controlled research runs, but warnings should be resolved before final live-data evidence is used.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_readiness_outputs(
+    readiness: pd.DataFrame,
+    summary: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    *,
+    config: LiveDataReadinessConfig,
+) -> None:
+    safe_write_table(readiness, parquet_path=config.readiness_output_table_path, csv_path=config.readiness_output_csv_path)
+    config.summary_output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(config.summary_output_csv_path, index=False)
+    config.diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics.to_csv(config.diagnostics_path, index=False)
+    config.markdown_report_path.parent.mkdir(parents=True, exist_ok=True)
+    config.markdown_report_path.write_text(render_markdown_report(readiness, summary), encoding="utf-8")
+
+
+def run_live_data_readiness(config: LiveDataReadinessConfig) -> pd.DataFrame:
+    logger = get_logger(
+        "fvn_dfm.live_data_readiness",
+        root() / "logs/pipeline/live_data_readiness.log",
+    )
+    logger.info("Running live data readiness checks.")
+    readiness = build_readiness_dataframe(config)
+    summary = build_readiness_summary(readiness, config)
+    diagnostics = build_readiness_diagnostics(readiness, summary)
+    write_readiness_outputs(readiness, summary, diagnostics, config=config)
+    logger.info("Live data readiness status: %s", summary.iloc[0]["live_readiness_status"])
+    return summary
+
+
+def default_config(repo_root: Path | None = None) -> LiveDataReadinessConfig:
+    r = repo_root or root()
+    return LiveDataReadinessConfig(
+        repo_root=r,
+        sec_config_path=r / "configs/01_data_sources.yaml",
+        readiness_output_table_path=r / "data/processed/reports/live_data_readiness_report.parquet",
+        readiness_output_csv_path=r / "data/processed/reports/live_data_readiness_report.csv",
+        summary_output_csv_path=r / "data/processed/reports/live_data_readiness_summary.csv",
+        markdown_report_path=r / "outputs/reports/live_data_readiness_report.md",
+        diagnostics_path=r / "outputs/diagnostics/live_data_readiness_diagnostics.csv",
+        raw_price_path=r / "data/raw/prices/adjusted_prices.csv",
+        lm_dictionary_dir=r / "data/raw/dictionaries/loughran_mcdonald",
+        fsds_raw_dir=r / "data/raw/sec/financial_statement_data_sets",
+        submissions_raw_dir=r / "data/raw/sec/submissions",
+        primary_documents_raw_dir=r / "data/raw/sec/primary_documents",
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run live-data readiness checks.")
+    parser.add_argument("--sec-config-path", default="configs/01_data_sources.yaml")
+    parser.add_argument("--raw-price-path", default="data/raw/prices/adjusted_prices.csv")
+    parser.add_argument("--lm-dictionary-dir", default="data/raw/dictionaries/loughran_mcdonald")
+    parser.add_argument("--fsds-raw-dir", default="data/raw/sec/financial_statement_data_sets")
+    parser.add_argument("--submissions-raw-dir", default="data/raw/sec/submissions")
+    parser.add_argument("--primary-documents-raw-dir", default="data/raw/sec/primary_documents")
+    parser.add_argument("--readiness-output-table", default="data/processed/reports/live_data_readiness_report.parquet")
+    parser.add_argument("--readiness-output-csv", default="data/processed/reports/live_data_readiness_report.csv")
+    parser.add_argument("--summary-output-csv", default="data/processed/reports/live_data_readiness_summary.csv")
+    parser.add_argument("--markdown-report-path", default="outputs/reports/live_data_readiness_report.md")
+    parser.add_argument("--diagnostics-path", default="outputs/diagnostics/live_data_readiness_diagnostics.csv")
+    parser.add_argument("--block-on-missing-sec-raw-dirs", action="store_true")
+    parser.add_argument("--block-on-missing-primary-documents", action="store_true")
+    parser.add_argument("--allow-missing-price-data", action="store_true")
+    parser.add_argument("--allow-missing-lm-dictionary", action="store_true")
+    parser.add_argument("--allow-missing-fsds", action="store_true")
+    parser.add_argument("--fail-on-blocked", action="store_true")
+    args = parser.parse_args()
+
+    r = root()
+    config = LiveDataReadinessConfig(
+        repo_root=r,
+        sec_config_path=r / args.sec_config_path,
+        readiness_output_table_path=r / args.readiness_output_table,
+        readiness_output_csv_path=r / args.readiness_output_csv,
+        summary_output_csv_path=r / args.summary_output_csv,
+        markdown_report_path=r / args.markdown_report_path,
+        diagnostics_path=r / args.diagnostics_path,
+        raw_price_path=r / args.raw_price_path,
+        lm_dictionary_dir=r / args.lm_dictionary_dir,
+        fsds_raw_dir=r / args.fsds_raw_dir,
+        submissions_raw_dir=r / args.submissions_raw_dir,
+        primary_documents_raw_dir=r / args.primary_documents_raw_dir,
+        block_on_missing_sec_raw_dirs=args.block_on_missing_sec_raw_dirs,
+        block_on_missing_primary_documents=args.block_on_missing_primary_documents,
+        block_on_missing_price_data=not args.allow_missing_price_data,
+        block_on_missing_lm_dictionary=not args.allow_missing_lm_dictionary,
+        block_on_missing_fsds=not args.allow_missing_fsds,
+    )
+    summary = run_live_data_readiness(config)
+    if args.fail_on_blocked and summary.iloc[0]["live_readiness_status"] == "BLOCKED":
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
