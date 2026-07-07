@@ -1,4 +1,4 @@
-# FVN Research Archive 001 — Disclosure–Fundamental Mismatch
+# FVN Research Archive 001 - Disclosure–Fundamental Mismatch
 
 This repository implements a point-in-time public-markets research project testing whether U.S. equities exhibit delayed repricing when SEC filing language and accounting fundamentals diverge.
 
@@ -17,7 +17,7 @@ Primary evidence standard:
 
 ## Current status
 
-Sprint 01 — Research Infrastructure.
+Sprint 01 - Research Infrastructure.
 
 No raw data is included in this repository. Raw public data must be downloaded through the configured ingestion scripts and recorded in `data/manifests/raw_file_manifest.csv`.
 
@@ -31,13 +31,13 @@ make audit-skeleton
 
 ## Research verdict classes
 
-A — Archive Alpha Candidate  
-B — Research Insight, Not Tradable Alpha  
-C — Mechanism Rejected  
-D — Inconclusive Due to Data Limitations
+A - Archive Alpha Candidate  
+B - Research Insight, Not Tradable Alpha  
+C - Mechanism Rejected  
+D - Inconclusive Due to Data Limitations
 
 
-## Sprint 02 — SEC submissions ingestion
+## Sprint 02 - SEC submissions ingestion
 
 Before downloading from SEC, edit:
 
@@ -104,7 +104,7 @@ and appended to:
 `data/manifests/raw_file_manifest.csv`.
 
 
-## Source table bridge — SEC filing events from submissions JSON
+## Source table bridge - SEC filing events from submissions JSON
 
 After downloading SEC submissions JSON files, build the normalized filing-event table and complete-submission candidate list:
 
